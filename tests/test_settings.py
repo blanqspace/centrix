@@ -1,4 +1,5 @@
 """Tests for the settings loader."""
+
 from __future__ import annotations
 
 from pathlib import Path

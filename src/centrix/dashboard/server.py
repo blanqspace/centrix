@@ -1,11 +1,12 @@
 """FastAPI dashboard placeholder for Centrix."""
+
 from __future__ import annotations
 
 import uvicorn
 from fastapi import FastAPI
 
-from .. import __version__
-from ..settings import get_settings
+from centrix import __version__
+from centrix.settings import get_settings
 
 settings = get_settings()
 
