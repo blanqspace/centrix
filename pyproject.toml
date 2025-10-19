@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "centrix"
+version = "0.1.0"
+description = "Centrix trading control platform foundation."
+readme = "README.md"
+authors = [{ name = "Centrix Team" }]
+requires-python = ">=3.11"
+dependencies = [
+    "typer[all]",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "rich>=13",
+    "textual>=0.48",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "black>=24.4",
+    "pre-commit>=3.7",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "B", "UP", "C4", "TID", "RUF"]
+fix = true
+
+[tool.mypy]
+strict = true
+python_version = "3.11"
+ignore_missing_imports = false
+packages = ["centrix"]

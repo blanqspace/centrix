@@ -1,0 +1,14 @@
+[Unit]
+Description=Centrix Confirmation Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/centrix
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/centrix/.venv/bin/python -m centrix.services.confirm_worker
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
