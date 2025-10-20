@@ -16,6 +16,7 @@ from typing import Any
 
 import typer
 
+from centrix.core import orders
 from centrix.core.alerts import alert_counters, emit_alert
 from centrix.core.logging import REPORT_DIR, TEXT_LOG, ensure_runtime_dirs, log_event
 from centrix.core.metrics import snapshot_kpis
@@ -53,8 +54,9 @@ SERVICE_MODULES = {
     "tui": "centrix.tui.control",
     "dashboard": "centrix.dashboard.server",
     "worker": "centrix.services.confirm_worker",
+    "slack": "centrix.services.slack",
 }
-SERVICE_NAMES: list[str] = list(SERVICE_MODULES)
+ALLOWED_TARGETS: list[str] = list(SERVICE_MODULES)
 LOCK_NAME = "svc.control"
 LOCK_TTL = 30
 PYTHON_BIN = Path(".venv/bin/python") if Path(".venv/bin/python").exists() else Path(sys.executable)
@@ -71,15 +73,18 @@ def version() -> None:
     typer.echo(__version__)
 
 
-def _resolve_targets(target: str) -> list[str]:
-    target_lower = target.lower()
-    if target_lower == "all":
-        return SERVICE_NAMES.copy()
-    if target_lower not in SERVICE_MODULES:
-        raise typer.BadParameter(
-            "target must be one of tui|dashboard|worker|all",
-        )
-    return [target_lower]
+def _parse_targets(target: str) -> list[str]:
+    value = target.strip().lower()
+    if value == "all":
+        return ALLOWED_TARGETS.copy()
+    selected = [part.strip().lower() for part in value.split(",") if part.strip()]
+    if not selected:
+        raise typer.BadParameter("target list cannot be empty")
+    bad = [name for name in selected if name not in ALLOWED_TARGETS]
+    if bad:
+        allowed = ",".join(ALLOWED_TARGETS)
+        raise typer.BadParameter(f"unknown target(s): {','.join(bad)}; allowed={allowed}")
+    return [name for name in ALLOWED_TARGETS if name in selected]
 
 
 @contextmanager
@@ -213,21 +218,13 @@ def _status(name: str) -> tuple[str, bool]:
 
 
 def _service_snapshot() -> dict[str, dict[str, Any]]:
-    snapshot: dict[str, dict[str, Any]] = {}
     bus = Bus(SETTINGS.ipc_db)
-    for name in SERVICE_NAMES:
-        pid = _read_pid(name)
-        running = bool(pid and is_running(pid))
-        entry: dict[str, Any] = {"pid": pid, "running": running}
-        if name == "worker":
-            entry["last_heartbeat"] = bus.get_heartbeat(name)
-        snapshot[name] = entry
-    return snapshot
+    return bus.get_services_status(ALLOWED_TARGETS)
 
 
 @svc_app.command("start")
 def svc_start(target: str = typer.Argument("all", help="Service target.")) -> None:
-    names = _resolve_targets(target)
+    names = _parse_targets(target)
     with _control_lock("svc.start", names):
         started = [name for name in names if _start_service(name)]
         skipped = [name for name in names if name not in started]
@@ -245,7 +242,7 @@ def svc_start(target: str = typer.Argument("all", help="Service target.")) -> No
 
 @svc_app.command("stop")
 def svc_stop(target: str = typer.Argument("all", help="Service target.")) -> None:
-    names = _resolve_targets(target)
+    names = _parse_targets(target)
     with _control_lock("svc.stop", names):
         stopped = [name for name in names if _stop_service(name)]
         idle = [name for name in names if name not in stopped]
@@ -263,7 +260,7 @@ def svc_stop(target: str = typer.Argument("all", help="Service target.")) -> Non
 
 @svc_app.command("status")
 def svc_status(target: str = typer.Argument("all", help="Service target.")) -> None:
-    names = _resolve_targets(target)
+    names = _parse_targets(target)
     lines = []
     running = 0
     for name in names:
@@ -335,6 +332,14 @@ def order_new(
     px: float = typer.Option(..., "--px", help="Price."),
 ) -> None:
     log_event("cli", "order.new", "stub order accepted", symbol=symbol, qty=qty, px=px)
+    orders.add_order(
+        {
+            "source": "cli",
+            "symbol": symbol,
+            "qty": qty,
+            "px": px,
+        }
+    )
     typer.echo(
         json.dumps(
             {"status": "accepted", "symbol": symbol, "qty": qty, "px": px}, separators=(",", ":")
@@ -384,6 +389,7 @@ def diag_snapshot() -> None:
         "services": _service_snapshot(),
         "kpi": snapshot_kpis(),
         "alerts": alert_counters(),
+        "orders": orders.list_orders(),
     }
     filename.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
     log_event("cli", "diag.snapshot", "diagnostic snapshot written", path=str(filename))

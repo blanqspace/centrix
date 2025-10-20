@@ -268,6 +268,33 @@ class Bus:
         except ValueError:
             return None
 
+    def get_services_status(self, services: list[str]) -> dict[str, dict[str, Any]]:
+        """Return runtime status information for the given services."""
+
+        result: dict[str, dict[str, Any]] = {}
+        for name in services:
+            path = pidfile(name)
+            pid: int | None = None
+            running = False
+            if path.exists():
+                try:
+                    pid = int(path.read_text(encoding="utf-8").strip())
+                except ValueError:
+                    path.unlink(missing_ok=True)
+                    pid = None
+            if pid and is_running(pid):
+                running = True
+            else:
+                if path.exists():
+                    path.unlink(missing_ok=True)
+                pid = None
+            entry: dict[str, Any] = {"pid": pid, "running": running}
+            heartbeat = self.get_heartbeat(name)
+            if heartbeat is not None:
+                entry["last_heartbeat"] = heartbeat
+            result[name] = entry
+        return result
+
     def _generate_token(self, length: int) -> str:
         return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(length))
 
