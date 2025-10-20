@@ -84,6 +84,12 @@ def emit_alert(level: str, topic: str, message: str, fingerprint: str) -> bool:
         corr_id=fingerprint,
         occurrences=1,
     )
+    try:
+        from centrix.services.slack import route_alert
+
+        route_alert(norm_level, topic, message, fingerprint=fingerprint)
+    except Exception:  # pragma: no cover - optional integration
+        pass
     return True
 
 

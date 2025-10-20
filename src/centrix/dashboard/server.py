@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import platform
 import secrets
 import sys
@@ -305,7 +306,7 @@ INDEX_HTML = """<!DOCTYPE html>
 
 
 def _require_token(request: Request) -> None:
-    token = settings.dashboard_auth_token
+    token = os.environ.get("DASHBOARD_AUTH_TOKEN") or get_settings().dashboard_auth_token
     if not token:
         return
     supplied = request.headers.get("X-Dashboard-Token")
@@ -446,7 +447,7 @@ def _handle_control_action(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _ws_authorized(websocket: WebSocket) -> bool:
-    token = settings.dashboard_auth_token
+    token = os.environ.get("DASHBOARD_AUTH_TOKEN") or get_settings().dashboard_auth_token
     if not token:
         return True
     query_token = websocket.query_params.get("token")
