@@ -15,6 +15,7 @@ from textual.binding import Binding
 from textual.widgets import Footer, Header, Input, Log, Static
 
 from centrix.core.logging import ensure_runtime_dirs, log_event
+from centrix.core.metrics import snapshot_kpis
 from centrix.ipc import is_running, pidfile, read_state
 from centrix.ipc.bus import Bus
 from centrix.settings import get_settings
@@ -79,8 +80,12 @@ class ControlApp(App[None]):
         paused_bool = bool(state.get("paused", False))
         paused_value = "1" if paused_bool else "0"
         running = self._running_services()
+        kpi = snapshot_kpis()
+        errors_1m = kpi.get("errors_1m", 0)
+        alerts_dedup = kpi.get("alerts_dedup_1m", 0)
         status_text = (
-            f"mode={mode_value} paused={paused_value} services={running}/{self._service_total}"
+            f"mode={mode_value} paused={paused_value} services={running}/{self._service_total} "
+            f"errors_1m={errors_1m} alerts_dedup={alerts_dedup}"
         )
         if self._status is not None:
             self._status.update(status_text)

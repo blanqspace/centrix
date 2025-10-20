@@ -7,6 +7,7 @@ import sys
 import time
 
 from centrix.core.logging import ensure_runtime_dirs, log_event
+from centrix.core.metrics import METRICS
 from centrix.ipc.bus import Bus, read_state
 from centrix.ipc.migrate import epoch_ms
 from centrix.settings import get_settings
@@ -38,8 +39,20 @@ def run() -> None:
 
         state = read_state()
         paused = bool(state.get("paused"))
+        open_approvals = bus.count_pending_approvals()
+        queue_depth = bus.count_pending_commands()
+        METRICS.update_open_approvals(open_approvals)
+        METRICS.update_queue_depth(queue_depth)
 
-        log_event("worker", "heartbeat", "worker alive", expired=expired, paused=paused)
+        log_event(
+            "worker",
+            "heartbeat",
+            "worker alive",
+            expired=expired,
+            paused=paused,
+            open_approvals=open_approvals,
+            queue_depth=queue_depth,
+        )
         if paused:
             log_event("worker", "state", "holding", level="INFO")
 
@@ -50,6 +63,7 @@ def run() -> None:
                 {"component": "confirm", "expired": expired, "ts": now_ms},
             )
             next_heartbeat = time.monotonic() + heartbeat_interval
+        bus.record_heartbeat("worker", now_ms)
 
         time.sleep(1)
 

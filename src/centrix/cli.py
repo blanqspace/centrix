@@ -10,14 +10,24 @@ import sys
 import time
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import typer
 
-from centrix.core.logging import ensure_runtime_dirs, log_event
-from centrix.ipc import is_running, pidfile, read_state, write_state
+from centrix.core.alerts import alert_counters, emit_alert
+from centrix.core.logging import REPORT_DIR, TEXT_LOG, ensure_runtime_dirs, log_event
+from centrix.core.metrics import snapshot_kpis
+from centrix.ipc import Bus, is_running, pidfile, read_state, write_state
 from centrix.settings import get_settings
-from centrix.shared.locks import acquire_lock, lock_owner, release_lock
+from centrix.shared.locks import (
+    acquire_lock,
+    list_lock_files,
+    lock_owner,
+    reaper_sweep,
+    release_lock,
+)
 
 from . import __version__
 
@@ -26,11 +36,17 @@ svc_app = typer.Typer(help="Manage Centrix services.")
 mode_app = typer.Typer(help="Manage execution mode.")
 state_app = typer.Typer(help="Pause/resume orchestration state.")
 order_app = typer.Typer(help="Submit control orders (stub).")
+locks_app = typer.Typer(help="Inspect cooperative locks.")
+diag_app = typer.Typer(help="Diagnostics and reporting.")
+log_cli_app = typer.Typer(help="Log inspection utilities.")
 
 app.add_typer(svc_app, name="svc")
 app.add_typer(mode_app, name="mode")
 app.add_typer(state_app, name="state")
 app.add_typer(order_app, name="order")
+app.add_typer(locks_app, name="locks")
+app.add_typer(diag_app, name="diag")
+app.add_typer(log_cli_app, name="log")
 
 SETTINGS = get_settings()
 SERVICE_MODULES = {
@@ -44,6 +60,8 @@ LOCK_TTL = 30
 PYTHON_BIN = Path(".venv/bin/python") if Path(".venv/bin/python").exists() else Path(sys.executable)
 
 ensure_runtime_dirs()
+
+_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "CRITICAL": 50}
 
 
 @app.command()
@@ -69,6 +87,12 @@ def _control_lock(action: str, target: Iterable[str]) -> Iterator[None]:
     names = ",".join(target)
     if not acquire_lock(LOCK_NAME, ttl=LOCK_TTL):
         owner = lock_owner(LOCK_NAME) or {}
+        emit_alert(
+            "ERROR",
+            f"{action}.lock",
+            "control lock busy",
+            fingerprint=f"{LOCK_NAME}:{names}",
+        )
         log_event(
             "cli",
             f"{action}.lock",
@@ -106,6 +130,11 @@ def _read_pid(name: str) -> int | None:
         return None
 
 
+def _normalise_level(level: str) -> str:
+    upper = level.upper()
+    return upper if upper in _LEVEL_ORDER else "INFO"
+
+
 def _start_service(name: str) -> bool:
     existing = _read_pid(name)
     if existing and is_running(existing):
@@ -113,9 +142,25 @@ def _start_service(name: str) -> bool:
     command = _service_command(name)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
-    process = subprocess.Popen(
-        command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
-    )
+    try:
+        process = subprocess.Popen(
+            command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+        )
+    except OSError as exc:
+        emit_alert(
+            "CRITICAL",
+            f"svc.{name}.start",
+            f"failed to start service {name}",
+            fingerprint=f"svc:{name}:start",
+        )
+        log_event(
+            "cli",
+            f"svc.{name}.start",
+            "service spawn failed",
+            level="ERROR",
+            error=str(exc),
+        )
+        return False
     _write_pid(name, process.pid)
     return True
 
@@ -129,7 +174,21 @@ def _stop_service(name: str) -> bool:
         return False
     try:
         os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        emit_alert(
+            "ERROR",
+            f"svc.{name}.stop",
+            f"failed to stop service {name}",
+            fingerprint=f"svc:{name}:stop",
+        )
+        log_event(
+            "cli",
+            f"svc.{name}.stop",
+            "service termination failed",
+            level="ERROR",
+            error=str(exc),
+            pid=pid,
+        )
         pidfile(name).unlink(missing_ok=True)
         return False
     timeout = time.time() + 5
@@ -151,6 +210,19 @@ def _status(name: str) -> tuple[str, bool]:
     if pid and is_running(pid):
         return (f"{name}: running pid={pid}", True)
     return (f"{name}: stopped", False)
+
+
+def _service_snapshot() -> dict[str, dict[str, Any]]:
+    snapshot: dict[str, dict[str, Any]] = {}
+    bus = Bus(SETTINGS.ipc_db)
+    for name in SERVICE_NAMES:
+        pid = _read_pid(name)
+        running = bool(pid and is_running(pid))
+        entry: dict[str, Any] = {"pid": pid, "running": running}
+        if name == "worker":
+            entry["last_heartbeat"] = bus.get_heartbeat(name)
+        snapshot[name] = entry
+    return snapshot
 
 
 @svc_app.command("start")
@@ -267,6 +339,89 @@ def order_new(
         json.dumps(
             {"status": "accepted", "symbol": symbol, "qty": qty, "px": px}, separators=(",", ":")
         )
+    )
+
+
+@locks_app.command("ls")
+def locks_ls() -> None:
+    entries = list_lock_files()
+    if not entries:
+        typer.echo("no locks")
+        return
+    header = f"{'name':<20} {'pid':>6} {'age_s':>10} {'ttl_s':>10} {'expired':>8}"
+    typer.echo(header)
+    now_ms = int(time.time() * 1000)
+    for entry in entries:
+        acquired = int(entry["acquired_at"])
+        ttl_ms = int(entry["ttl_ms"])
+        age_s = max(0.0, (now_ms - acquired) / 1000)
+        ttl_s = ttl_ms / 1000 if ttl_ms else 0.0
+        expired_text = "true" if entry["expired"] else "false"
+        line = (
+            f"{entry['name']:<20} {entry['pid']:>6} {age_s:>10.1f} "
+            f"{ttl_s:>10.1f} {expired_text:>8}"
+        )
+        typer.echo(line)
+    log_event("cli", "locks.ls", "listed lock files", count=len(entries))
+
+
+@locks_app.command("reap")
+def locks_reap() -> None:
+    removed = reaper_sweep()
+    typer.echo(f"removed={removed}")
+    log_event("cli", "locks.reap", "reaper sweep executed", removed=removed)
+
+
+@diag_app.command("snapshot")
+def diag_snapshot() -> None:
+    ensure_runtime_dirs()
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now()
+    filename = REPORT_DIR / f"diag_{timestamp.strftime('%Y%m%d_%H%M%S')}.json"
+    data = {
+        "ts": timestamp.isoformat(timespec="seconds"),
+        "state": read_state(),
+        "services": _service_snapshot(),
+        "kpi": snapshot_kpis(),
+        "alerts": alert_counters(),
+    }
+    filename.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    log_event("cli", "diag.snapshot", "diagnostic snapshot written", path=str(filename))
+    typer.echo(str(filename))
+
+
+@log_cli_app.command("tail")
+def log_tail(
+    level: str = typer.Option("INFO", "--level", "-l", help="Minimum level to include."),
+    lines: int = typer.Option(20, "--lines", "-n", help="Number of lines to display."),
+) -> None:
+    ensure_runtime_dirs()
+    min_level = _normalise_level(level)
+    if not TEXT_LOG.exists():
+        typer.secho("log file not found", err=True, fg=typer.colors.RED)
+        raise typer.Exit(1)
+
+    def _line_level(line: str) -> str:
+        for part in line.split():
+            if part.startswith("level="):
+                return _normalise_level(part.split("=", 1)[1])
+        return "INFO"
+
+    with TEXT_LOG.open("r", encoding="utf-8") as handle:
+        lines_buffer = [
+            line.rstrip("\n")
+            for line in handle.readlines()
+            if _LEVEL_ORDER.get(_line_level(line), 0) >= _LEVEL_ORDER[min_level]
+        ]
+    for entry in lines_buffer[-lines:]:
+        typer.echo(entry)
+    log_event(
+        "cli",
+        "log.tail",
+        "log tail executed",
+        min_level=min_level,
+        lines=lines,
+        matched=len(lines_buffer),
     )
 
 

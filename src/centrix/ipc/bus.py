@@ -207,6 +207,26 @@ class Bus:
             conn.commit()
             return int(cursor.rowcount)
 
+    def count_pending_commands(self) -> int:
+        """Return the number of queued commands awaiting processing."""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(1) AS total FROM commands WHERE status = 'NEW'",
+            )
+            row = cursor.fetchone()
+            return int(row["total"]) if row else 0
+
+    def count_pending_approvals(self) -> int:
+        """Return the number of approvals in pending state."""
+
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "SELECT COUNT(1) AS total FROM approvals WHERE status = 'PENDING'",
+            )
+            row = cursor.fetchone()
+            return int(row["total"]) if row else 0
+
     def set_kv(self, key: str, value: str) -> None:
         """Upsert a key/value pair."""
 
@@ -231,6 +251,22 @@ class Bus:
             )
             row = cursor.fetchone()
             return row["v"] if row else None
+
+    def record_heartbeat(self, component: str, ts_ms: int) -> None:
+        """Record a heartbeat timestamp for a component."""
+
+        self.set_kv(f"heartbeat:{component}", str(ts_ms))
+
+    def get_heartbeat(self, component: str) -> int | None:
+        """Fetch the last recorded heartbeat for a component."""
+
+        value = self.get_kv(f"heartbeat:{component}")
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
     def _generate_token(self, length: int) -> str:
         return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(length))

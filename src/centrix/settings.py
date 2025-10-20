@@ -44,6 +44,10 @@ class AppSettings(BaseSettings):
     approval_token_length: int = 6
     state_file: str = "runtime/state.json"
 
+    alert_dedup_window_sec: int = 60
+    alert_rate_per_min: int = 20
+    alert_min_level: str = "WARN"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> AppSettings:
