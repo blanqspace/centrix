@@ -1,12 +1,10 @@
-"""Logging utilities for Centrix."""
+"""Structured plaintext logging helpers for Centrix."""
 
 from __future__ import annotations
 
-import json
-import logging
+from datetime import datetime
 from pathlib import Path
-
-from centrix.ipc.migrate import epoch_ms
+from typing import Any
 
 RUNTIME_ROOT = Path("runtime")
 LOG_DIR = RUNTIME_ROOT / "logs"
@@ -15,7 +13,6 @@ PID_DIR = RUNTIME_ROOT / "pids"
 REPORT_DIR = RUNTIME_ROOT / "reports"
 
 TEXT_LOG = LOG_DIR / "centrix.log"
-JSON_LOG = LOG_DIR / "centrix.jsonl"
 
 
 def ensure_runtime_dirs() -> None:
@@ -25,39 +22,21 @@ def ensure_runtime_dirs() -> None:
         path.mkdir(parents=True, exist_ok=True)
 
 
-def _text_handler_exists(logger: logging.Logger) -> bool:
-    for handler in logger.handlers:
-        if getattr(handler, "_centrix_text_handler", False):
-            return True
-    return False
-
-
-def get_text_logger(name: str = "centrix") -> logging.Logger:
-    """Return a logger configured to write to the text log."""
-
-    ensure_runtime_dirs()
-    logger = logging.getLogger(name)
-    if not _text_handler_exists(logger):
-        handler = logging.FileHandler(TEXT_LOG, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-        handler._centrix_text_handler = True  # type: ignore[attr-defined]
-        logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-    return logger
-
-
-def log_json(level: str, message: str, **fields: object) -> None:
-    """Append a JSON log record to the JSONL log."""
+def log_event(
+    svc: str,
+    topic: str,
+    message: str,
+    *,
+    level: str = "INFO",
+    **fields: Any,
+) -> None:
+    """Write a structured plaintext log entry."""
 
     ensure_runtime_dirs()
-    entry = {
-        "ts": epoch_ms(),
-        "level": level.upper(),
-        "msg": message,
-    }
-    if fields:
-        entry.update(fields)
-    with JSON_LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, separators=(",", ":"), ensure_ascii=False))
-        handle.write("\n")
+    ts = datetime.now().isoformat(timespec="seconds")
+    parts = [f"[{ts}]", f"level={level.upper()}", f"svc={svc}", f"topic={topic}"]
+    for key, value in fields.items():
+        parts.append(f"{key}={value}")
+    parts.append(f'msg="{message}"')
+    with TEXT_LOG.open("a", encoding="utf-8") as handle:
+        handle.write(" ".join(parts) + "\n")

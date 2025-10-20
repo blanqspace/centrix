@@ -1,5 +1,5 @@
 """Core utilities for logging, lock management, and runtime preparation."""
 
-from .logging import ensure_runtime_dirs, get_text_logger, log_json
+from .logging import ensure_runtime_dirs, log_event
 
-__all__ = ["ensure_runtime_dirs", "get_text_logger", "log_json"]
+__all__ = ["ensure_runtime_dirs", "log_event"]

@@ -33,5 +33,5 @@ systemd-analyze --user verify systemd/centrix-tui.service systemd/centrix-dashbo
 
 chmod +x tools/tmux_centrix.sh
 TMUX= tmux kill-session -t centrix 2>/dev/null || true
-TMUX= timeout 8s ./tools/tmux_centrix.sh |& tee runtime/reports/tmux_run.txt || true
+TMUX= timeout 8s ./tools/tmux_centrix.sh --detached |& tee runtime/reports/tmux_run.txt || true
 TMUX= tmux kill-session -t centrix 2>/dev/null || true

@@ -3,16 +3,24 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import sqlite3
 import string
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
+
+from centrix.core.logging import ensure_runtime_dirs
+from centrix.settings import get_settings
 
 from .migrate import ensure_db, epoch_ms
 
 _TOKEN_ALPHABET = string.ascii_uppercase + string.digits
+_SETTINGS = get_settings()
+STATE_FILE = Path(_SETTINGS.state_file)
+PID_DIR = Path("runtime/pids")
 
 
 def _dumps(data: dict[str, Any]) -> str:
@@ -226,3 +234,56 @@ class Bus:
 
     def _generate_token(self, length: int) -> str:
         return "".join(secrets.choice(_TOKEN_ALPHABET) for _ in range(length))
+
+
+def _default_state() -> dict[str, Any]:
+    return {"mode": "mock", "mode_mock": True, "paused": False}
+
+
+def read_state() -> dict[str, Any]:
+    """Read the persisted control state, creating defaults if necessary."""
+
+    ensure_runtime_dirs()
+    if not STATE_FILE.exists():
+        state = _default_state()
+        STATE_FILE.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+        return state
+
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):  # pragma: no cover - defensive
+            raise ValueError
+    except (json.JSONDecodeError, ValueError):
+        data = _default_state()
+    merged = _default_state()
+    merged.update(data)
+    return merged
+
+
+def write_state(**fields: Any) -> dict[str, Any]:
+    """Update the control state with the provided fields."""
+
+    state = read_state()
+    state.update(fields)
+    ensure_runtime_dirs()
+    STATE_FILE.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    return state
+
+
+def pidfile(name: str) -> Path:
+    """Return the pidfile path for a named service."""
+
+    ensure_runtime_dirs()
+    PID_DIR.mkdir(parents=True, exist_ok=True)
+    safe = name.replace("/", "_")
+    return PID_DIR / f"{safe}.pid"
+
+
+def is_running(pid: int) -> bool:
+    """Return whether the provided PID appears active."""
+
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True

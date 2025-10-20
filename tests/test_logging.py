@@ -1,22 +1,19 @@
 from __future__ import annotations
 
-import json
-
-from centrix.core.logging import ensure_runtime_dirs, get_text_logger, log_json
+from centrix.core.logging import ensure_runtime_dirs, log_event
 
 
-def test_log_json_creates_valid_entry(tmp_path, monkeypatch) -> None:
+def test_log_event_creates_structured_line(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     ensure_runtime_dirs()
 
-    logger = get_text_logger("centrix.test")
-    logger.info("text line")
+    log_event("test", "unit", "hello", foo="bar", level="INFO")
 
-    log_json("INFO", "hello", foo="bar")
-
-    json_path = tmp_path / "runtime/logs/centrix.jsonl"
-    contents = json_path.read_text(encoding="utf-8").strip().splitlines()
+    log_path = tmp_path / "runtime/logs/centrix.log"
+    contents = log_path.read_text(encoding="utf-8").strip().splitlines()
     assert contents
-    record = json.loads(contents[-1])
-    assert record["msg"] == "hello"
-    assert record["foo"] == "bar"
+    line = contents[-1]
+    assert "svc=test" in line
+    assert "topic=unit" in line
+    assert 'msg="hello"' in line
+    assert "foo=bar" in line

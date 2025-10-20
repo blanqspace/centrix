@@ -6,8 +6,8 @@ import signal
 import sys
 import time
 
-from centrix.core.logging import ensure_runtime_dirs, get_text_logger, log_json
-from centrix.ipc.bus import Bus
+from centrix.core.logging import ensure_runtime_dirs, log_event
+from centrix.ipc.bus import Bus, read_state
 from centrix.ipc.migrate import epoch_ms
 from centrix.settings import get_settings
 
@@ -23,11 +23,9 @@ def run() -> None:
     ensure_runtime_dirs()
     settings = get_settings()
     bus = Bus(settings.ipc_db)
-    logger = get_text_logger("centrix.worker.confirm")
     _install_signal_handlers()
 
-    logger.info("confirm worker starting")
-    log_json("INFO", "worker starting", component="confirm")
+    log_event("worker", "startup", "confirm worker starting")
 
     heartbeat_interval = 5.0
     next_heartbeat = time.monotonic()
@@ -36,11 +34,14 @@ def run() -> None:
         now_ms = epoch_ms()
         expired = bus.expire_approvals(now_ms)
         if expired:
-            logger.info("expired %s approvals", expired)
-            log_json("INFO", "approvals expired", component="confirm", count=expired)
+            log_event("worker", "approvals", "expired approvals", count=expired)
 
-        logger.info("worker alive")
-        log_json("INFO", "worker alive", component="confirm", expired=expired)
+        state = read_state()
+        paused = bool(state.get("paused"))
+
+        log_event("worker", "heartbeat", "worker alive", expired=expired, paused=paused)
+        if paused:
+            log_event("worker", "state", "holding", level="INFO")
 
         if time.monotonic() >= next_heartbeat:
             bus.emit(

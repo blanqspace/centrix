@@ -42,6 +42,7 @@ class AppSettings(BaseSettings):
     ibkr_client_id: int = 7
 
     approval_token_length: int = 6
+    state_file: str = "runtime/state.json"
 
 
 @lru_cache(maxsize=1)
