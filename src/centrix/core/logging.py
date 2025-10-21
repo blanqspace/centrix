@@ -23,6 +23,8 @@ JSON_LOG = LOG_DIR / "centrix.jsonl"
 LOG_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
 LOG_BACKUP_COUNT = 5
 _LOG_LOCK = Lock()
+_ENV_WARNED: set[str] = set()
+_ENV_WARN_LOCK = Lock()
 
 _LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "CRITICAL": 50}
 
@@ -120,3 +122,27 @@ def log_event(
 
     if _LEVEL_ORDER.get(level_norm, 0) >= _LEVEL_ORDER["ERROR"]:
         METRICS.record_error()
+
+
+def warn_on_local_env(svc: str) -> None:
+    """Emit a one-time warning if a local .env file is present."""
+
+    path = Path(".env")
+    if not path.exists():
+        return
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = str(path)
+    key = f"{svc}:{resolved}"
+    with _ENV_WARN_LOCK:
+        if key in _ENV_WARNED:
+            return
+        _ENV_WARNED.add(key)
+    log_event(
+        svc,
+        "config.env",
+        ".env file detected",
+        level="WARN",
+        path=resolved,
+    )

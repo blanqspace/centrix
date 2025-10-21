@@ -14,7 +14,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Footer, Header, Input, Log, Static
 
-from centrix.core.logging import ensure_runtime_dirs, log_event
+from centrix.core.logging import ensure_runtime_dirs, log_event, warn_on_local_env
 from centrix.core.metrics import snapshot_kpis
 from centrix.ipc import is_running, pidfile, read_state
 from centrix.ipc.bus import Bus
@@ -45,6 +45,7 @@ class ControlApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         ensure_runtime_dirs()
+        warn_on_local_env("tui")
         self._settings = get_settings()
         self._python_bin = Path(".venv/bin/python")
         if not self._python_bin.exists():

@@ -21,7 +21,13 @@ import typer
 
 from centrix.core import orders
 from centrix.core.alerts import alert_counters, emit_alert
-from centrix.core.logging import REPORT_DIR, TEXT_LOG, ensure_runtime_dirs, log_event
+from centrix.core.logging import (
+    REPORT_DIR,
+    TEXT_LOG,
+    ensure_runtime_dirs,
+    log_event,
+    warn_on_local_env,
+)
 from centrix.core.metrics import snapshot_kpis
 from centrix.ipc import Bus, is_running, pidfile, read_state, write_state
 from centrix.settings import get_settings
@@ -66,6 +72,7 @@ PYTHON_BIN = Path(".venv/bin/python") if Path(".venv/bin/python").exists() else 
 DASHBOARD_LOG = Path("/tmp/ml_dashboard.log")
 
 ensure_runtime_dirs()
+warn_on_local_env("cli")
 
 _LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40, "CRITICAL": 50}
 
@@ -310,16 +317,24 @@ def _stop_service(name: str) -> bool:
     return True
 
 
-def _status(name: str) -> tuple[str, bool]:
-    pid = _read_pid(name)
-    if pid and is_running(pid):
-        return (f"{name}: running pid={pid}", True)
-    return (f"{name}: stopped", False)
-
-
 def _service_snapshot() -> dict[str, dict[str, Any]]:
     bus = Bus(SETTINGS.ipc_db)
     return bus.get_services_status(ALLOWED_TARGETS)
+
+
+def _format_status_line(name: str, info: dict[str, Any]) -> tuple[str, bool]:
+    running = bool(info.get("running"))
+    pid = info.get("pid")
+    pid_text = str(pid) if pid is not None else "-"
+    elapsed = info.get("elapsed_ms")
+    elapsed_text = "-"
+    if running and isinstance(elapsed, (int, float)):
+        elapsed_text = f"{elapsed / 1000:.1f}s"
+    detail = info.get("detail")
+    line = f"{name}: {'running' if running else 'stopped'} pid={pid_text} elapsed={elapsed_text}"
+    if detail:
+        line += f" detail={detail}"
+    return (line, running)
 
 
 def _wait_for_dashboard(timeout: float = 8.0) -> tuple[bool, str | None]:
@@ -380,10 +395,12 @@ def svc_stop(target: str = typer.Argument("all", help="Service target.")) -> Non
 @svc_app.command("status")
 def svc_status(target: str = typer.Argument("all", help="Service target.")) -> None:
     names = _parse_targets(target)
+    snapshot = _service_snapshot()
     lines = []
     running = 0
     for name in names:
-        line, is_running_flag = _status(name)
+        info = snapshot.get(name, {})
+        line, is_running_flag = _format_status_line(name, info)
         lines.append(line)
         if is_running_flag:
             running += 1

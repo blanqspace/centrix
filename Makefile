@@ -2,7 +2,7 @@ VENV ?= .venv
 PYTHON ?= $(VENV)/bin/python
 PIP ?= $(VENV)/bin/pip
 
-.PHONY: init run-tui run-dashboard lint test fmt
+.PHONY: init run-tui run-dashboard lint test fmt env-check
 
 init:
 	python3 -m venv $(VENV)
@@ -24,3 +24,6 @@ fmt:
 
 test:
 	$(VENV)/bin/pytest -q
+
+env-check:
+	$(PYTHON) tools/env_check.py

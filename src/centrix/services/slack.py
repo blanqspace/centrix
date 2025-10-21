@@ -6,6 +6,7 @@ import json
 import signal
 import sys
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ from centrix.core import orders
 from centrix.core.approvals import confirm as approve_order
 from centrix.core.approvals import reject as reject_order
 from centrix.core.approvals import request_approval
-from centrix.core.logging import ensure_runtime_dirs, log_event
+from centrix.core.logging import ensure_runtime_dirs, log_event, warn_on_local_env
 from centrix.core.metrics import METRICS
 from centrix.core.rbac import allow, role_of
 from centrix.ipc import read_state, write_state
@@ -806,6 +807,74 @@ def route_alert(level: str, topic: str, message: str, **fields: Any) -> None:
     get_slack_out().post_message(channel_for("alerts"), payload, metadata=metadata)
 
 
+def process_slash_command_request(
+    body: Mapping[str, Any] | None,
+    ack: Callable[[], Any],
+    respond: Callable[[str], Any],
+    *,
+    handler: Callable[..., dict[str, Any]] = handle_slash_command,
+) -> None:
+    """Wrap slash command handling ensuring immediate acknowledgement."""
+
+    ack()
+    payload = dict(body) if isinstance(body, Mapping) else {}
+    user_id = str(payload.get("user_id") or "")
+    text_raw = payload.get("text")
+    text = str(text_raw) if text_raw is not None else ""
+    try:
+        response = handler(user_id=user_id, text=text)
+        message = str(response.get("text") or "ok")
+    except Exception as exc:  # pragma: no cover - defensive
+        log_event("slack", "handler", "cx error", level="ERROR", error=str(exc))
+        respond("error processing command")
+        return
+    respond(message)
+
+
+def process_action_request(
+    action_id: str,
+    body: Mapping[str, Any] | None,
+    ack: Callable[[], Any],
+    respond: Callable[[str], Any],
+    *,
+    handler: Callable[..., dict[str, Any]] = handle_button,
+) -> None:
+    """Wrap interactive action handling extracting metadata safely."""
+
+    ack()
+    payload = dict(body) if isinstance(body, Mapping) else {}
+    user_section = payload.get("user")
+    user_id = ""
+    if isinstance(user_section, Mapping):
+        user_id = str(user_section.get("id") or "")
+    message_section = payload.get("message")
+    metadata: Mapping[str, Any] | None = None
+    if isinstance(message_section, Mapping):
+        candidate = message_section.get("metadata")
+        if isinstance(candidate, Mapping):
+            metadata = candidate
+    order_id = 0
+    if metadata is not None:
+        raw_order = metadata.get("order_id")
+        if isinstance(raw_order, int):
+            order_id = raw_order
+        elif isinstance(raw_order, str):
+            try:
+                order_id = int(raw_order)
+            except ValueError:
+                order_id = 0
+    token_raw = metadata.get("token") if metadata else None
+    token = token_raw if isinstance(token_raw, str) else None
+    try:
+        response = handler(action_id, user=user_id, order_id=order_id, token=token)
+        message = str(response.get("text") or "ok")
+    except Exception as exc:  # pragma: no cover - defensive
+        log_event("slack", "handler", f"{action_id} error", level="ERROR", error=str(exc))
+        respond("error")
+        return
+    respond(message)
+
+
 class SlackService:
     """Slack service runtime handling simulation or socket mode."""
 
@@ -855,49 +924,22 @@ class SlackService:
 
         @app.command("/cx")  # type: ignore[misc]
         def _cx_command(ack: Any, body: Any, respond: Any) -> None:
-            # immediate ack to avoid dispatch_failed
-            ack()
-            try:
-                user_id = body.get("user_id") or ""
-                text = (body.get("text") or "help").strip()
-                resp = handle_slash_command(user_id=user_id, text=text)
-                respond(resp.get("text", "ok"))
-            except Exception as exc:  # defensive
-                log_event("slack", "handler", "cx error", level="ERROR", error=str(exc))
-                respond("error processing command")
+            process_slash_command_request(body, ack, respond)
 
         @app.action({"action_id": "confirm"})  # type: ignore[misc]
         def _confirm_action(ack: Any, body: Any, respond: Any) -> None:
-            ack()
-            try:
-                user_id = (body.get("user") or {}).get("id") or ""
-                meta = (body.get("message") or {}).get("metadata") or {}
-                order_id = int(meta.get("order_id") or 0)
-                token = meta.get("token")
-                resp = handle_button("confirm", user=user_id, order_id=order_id, token=token)
-                respond(resp.get("text", "ok"))
-            except Exception as exc:
-                log_event("slack", "handler", "confirm error", level="ERROR", error=str(exc))
-                respond("error")
+            process_action_request("confirm", body, ack, respond)
 
         @app.action({"action_id": "reject"})  # type: ignore[misc]
         def _reject_action(ack: Any, body: Any, respond: Any) -> None:
-            ack()
-            try:
-                user_id = (body.get("user") or {}).get("id") or ""
-                meta = (body.get("message") or {}).get("metadata") or {}
-                order_id = int(meta.get("order_id") or 0)
-                resp = handle_button("reject", user=user_id, order_id=order_id, token=None)
-                respond(resp.get("text", "ok"))
-            except Exception as exc:
-                log_event("slack", "handler", "reject error", level="ERROR", error=str(exc))
-                respond("error")
+            process_action_request("reject", body, ack, respond)
 
         log_event("slack", "startup", "slack socket-mode starting")
         SocketModeHandler(app, app_token).start()
 
     def run(self) -> None:
         ensure_runtime_dirs()
+        warn_on_local_env("slack")
         _install_signal_handlers()
         mode = "sim" if self.out.simulation else "real"
         log_event("slack", "start", "slack service starting", mode=mode)

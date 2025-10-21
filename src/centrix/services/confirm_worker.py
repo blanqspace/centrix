@@ -6,7 +6,7 @@ import signal
 import sys
 import time
 
-from centrix.core.logging import ensure_runtime_dirs, log_event
+from centrix.core.logging import ensure_runtime_dirs, log_event, warn_on_local_env
 from centrix.core.metrics import METRICS
 from centrix.ipc.bus import Bus, read_state
 from centrix.ipc.migrate import epoch_ms
@@ -22,6 +22,7 @@ def run() -> None:
     """Run the worker loop, logging a heartbeat once per second."""
 
     ensure_runtime_dirs()
+    warn_on_local_env("worker")
     settings = get_settings()
     bus = Bus(settings.ipc_db)
     _install_signal_handlers()

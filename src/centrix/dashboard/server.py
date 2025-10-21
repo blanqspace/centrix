@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from centrix import __version__
 from centrix.cli import _start_service, _stop_service
 from centrix.core.alerts import alert_counters
-from centrix.core.logging import log_event
+from centrix.core.logging import log_event, warn_on_local_env
 from centrix.core.metrics import METRICS, snapshot_kpis
 from centrix.core.orders import add_order, list_orders
 from centrix.ipc import read_state, write_state
@@ -45,6 +45,7 @@ WS_PUSH_INTERVAL = 2.0
 EVENT_LIMIT = 25
 
 app = FastAPI(title=settings.app_brand, version=__version__)
+warn_on_local_env("dashboard")
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">

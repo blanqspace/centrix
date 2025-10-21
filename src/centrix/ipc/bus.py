@@ -7,6 +7,7 @@ import os
 import secrets
 import sqlite3
 import string
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -272,6 +273,7 @@ class Bus:
         """Return runtime status information for the given services."""
 
         result: dict[str, dict[str, Any]] = {}
+        now_ms = epoch_ms()
         for name in services:
             path = pidfile(name)
             pid: int | None = None
@@ -292,6 +294,18 @@ class Bus:
             heartbeat = self.get_heartbeat(name)
             if heartbeat is not None:
                 entry["last_heartbeat"] = heartbeat
+            if running:
+                elapsed_ms: int | None = None
+                if heartbeat is not None:
+                    elapsed_ms = max(0, now_ms - heartbeat)
+                else:
+                    try:
+                        stat = path.stat()
+                        elapsed_ms = max(0, int((time.time() - stat.st_mtime) * 1000))
+                    except OSError:
+                        elapsed_ms = None
+                if elapsed_ms is not None:
+                    entry["elapsed_ms"] = elapsed_ms
             result[name] = entry
         return result
 
