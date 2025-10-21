@@ -8,11 +8,14 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request
 
 import typer
 
@@ -60,6 +63,7 @@ ALLOWED_TARGETS: list[str] = list(SERVICE_MODULES)
 LOCK_NAME = "svc.control"
 LOCK_TTL = 30
 PYTHON_BIN = Path(".venv/bin/python") if Path(".venv/bin/python").exists() else Path(sys.executable)
+DASHBOARD_LOG = Path("/tmp/ml_dashboard.log")
 
 ensure_runtime_dirs()
 
@@ -207,9 +211,42 @@ def _start_service(name: str) -> bool:
     existing = _read_pid(name)
     if existing and is_running(existing):
         return False
-    command = _service_command(name)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
+    if name == "dashboard":
+        command = [sys.executable, "-m", "centrix.dashboard.server"]
+        DASHBOARD_LOG.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with DASHBOARD_LOG.open("ab") as log_handle:
+                process = subprocess.Popen(command, stdout=log_handle, stderr=log_handle, env=env)
+        except OSError as exc:
+            emit_alert(
+                "CRITICAL",
+                "svc.dashboard.start",
+                "failed to start dashboard",
+                fingerprint="svc:dashboard:start",
+            )
+            log_event(
+                "cli",
+                "svc.dashboard.start",
+                "service spawn failed",
+                level="ERROR",
+                error=str(exc),
+            )
+            return False
+        _write_pid(name, process.pid)
+        ok, last_error = _wait_for_dashboard(timeout=8.0)
+        result = "ok" if ok else "timeout"
+        log_fields: dict[str, Any] = {"target": "dashboard", "result": result}
+        if last_error:
+            log_fields["error"] = last_error
+        log_event("cli", "svc.wait", "dashboard readiness check", **log_fields)
+        if not ok:
+            _stop_service("dashboard")
+            return False
+        return True
+
+    command = _service_command(name)
     try:
         process = subprocess.Popen(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
@@ -285,6 +322,25 @@ def _service_snapshot() -> dict[str, dict[str, Any]]:
     return bus.get_services_status(ALLOWED_TARGETS)
 
 
+def _wait_for_dashboard(timeout: float = 8.0) -> tuple[bool, str | None]:
+    host = SETTINGS.dashboard_host
+    port = SETTINGS.dashboard_port
+    url = f"http://{host}:{port}/healthz"
+    deadline = time.monotonic() + timeout
+    last_error: str | None = None
+    while time.monotonic() < deadline:
+        try:
+            with request.urlopen(url, timeout=1) as response:
+                if 200 <= response.status < 300:
+                    return True, None
+        except urlerror.URLError as exc:
+            last_error = str(exc.reason) if getattr(exc, "reason", None) else str(exc)
+        except Exception as exc:  # pragma: no cover - defensive
+            last_error = str(exc)
+        time.sleep(0.25)
+    return False, last_error
+
+
 @svc_app.command("start")
 def svc_start(target: str = typer.Argument("all", help="Service target.")) -> None:
     names = _parse_targets(target)
@@ -336,6 +392,72 @@ def svc_status(target: str = typer.Argument("all", help="Service target.")) -> N
     summary = f"Summary: running={running}/{len(names)}"
     typer.echo(summary)
     log_event("cli", "svc.status", "status command executed", running=running, total=len(names))
+
+
+@svc_app.command("wait")
+def svc_wait_command(
+    target: str = typer.Argument("dashboard", help="Service target (dashboard only)."),
+    timeout: float = typer.Option(8.0, "--timeout", "-t", help="Seconds to wait for readiness."),
+) -> None:
+    names = _parse_targets(target)
+    if names != ["dashboard"]:
+        typer.echo("svc wait currently supports the dashboard service only.")
+        raise typer.Exit(1)
+    ok, last_error = _wait_for_dashboard(timeout=timeout)
+    result = "ok" if ok else "timeout"
+    log_fields: dict[str, Any] = {"target": "dashboard", "result": result}
+    if last_error:
+        log_fields["error"] = last_error
+    log_event("cli", "svc.wait", "wait command executed", **log_fields)
+    if ok:
+        typer.echo("dashboard ready")
+        return
+    typer.echo("dashboard wait timeout")
+    _stop_service("dashboard")
+    raise typer.Exit(1)
+
+
+def _emit_log_stream(path: Path, lines: int, follow: bool) -> None:
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            if lines > 0:
+                buffer = deque(handle, maxlen=max(lines, 0))
+                for entry in buffer:
+                    typer.echo(entry.rstrip("\n"))
+            else:
+                for entry in handle:
+                    typer.echo(entry.rstrip("\n"))
+            if not follow:
+                return
+            handle.seek(0, os.SEEK_END)
+            try:
+                while True:
+                    entry = handle.readline()
+                    if entry:
+                        typer.echo(entry.rstrip("\n"))
+                    else:
+                        time.sleep(0.5)
+            except KeyboardInterrupt:
+                return
+    except FileNotFoundError:
+        typer.echo(f"Log file not found: {path}")
+
+
+@svc_app.command("logs")
+def svc_logs(
+    target: str = typer.Argument("dashboard", help="Service target (dashboard only)."),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Stream log output."),
+    lines: int = typer.Option(100, "--lines", "-n", help="Show the last N lines (<=0 for all)."),
+) -> None:
+    names = _parse_targets(target)
+    if names != ["dashboard"]:
+        typer.echo("svc logs currently supports the dashboard service only.")
+        raise typer.Exit(1)
+    log_path = DASHBOARD_LOG if DASHBOARD_LOG.exists() else Path("runtime/logs/centrix.log")
+    if not log_path.exists():
+        typer.echo("no dashboard log available")
+        return
+    _emit_log_stream(log_path, lines, follow)
 
 
 @mode_app.command("set")

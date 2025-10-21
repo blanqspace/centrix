@@ -17,6 +17,7 @@ dependencies = [
     "textual>=0.48",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    "slack_sdk>=3.30",
 ]
 
 [project.optional-dependencies]
@@ -56,4 +57,8 @@ packages = ["centrix"]
 
 [[tool.mypy.overrides]]
 module = ["slack_sdk", "slack_sdk.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["slack_bolt", "slack_bolt.*"]
 ignore_missing_imports = true

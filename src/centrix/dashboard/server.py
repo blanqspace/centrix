@@ -8,7 +8,7 @@ import os
 import platform
 import secrets
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +30,7 @@ from centrix.core.metrics import METRICS, snapshot_kpis
 from centrix.core.orders import add_order, list_orders
 from centrix.ipc import read_state, write_state
 from centrix.ipc.bus import Bus
-from centrix.settings import get_settings
+from centrix.settings import AppSettings, get_settings
 
 settings = get_settings()
 
@@ -52,91 +52,161 @@ INDEX_HTML = """<!DOCTYPE html>
     <meta charset="utf-8">
     <title>Centrix Dashboard</title>
     <style>
+      :root {
+        --bg: #f7f7f8;
+        --card: #ffffff;
+        --text: #0a0a0a;
+        --muted: #555555;
+        --border: #e5e7eb;
+        --primary: #1d4ed8;
+        --primary-hover: #1e40af;
+        --header: #ffffff;
+      }
+      .dark {
+        --bg: #101820;
+        --card: #1c2733;
+        --text: #f0f3f7;
+        --muted: #a0aec0;
+        --border: #243447;
+        --primary: #3b82f6;
+        --primary-hover: #2563eb;
+        --header: #17202b;
+      }
+      * {
+        box-sizing: border-box;
+      }
       body {
-        font-family: sans-serif;
+        font-family: "Inter", "Segoe UI", system-ui, sans-serif;
         margin: 0;
         padding: 0;
-        background: #101820;
-        color: #f0f3f7;
+        background: var(--bg);
+        color: var(--text);
+        font-size: 18px;
+        line-height: 1.5;
+        transition: background 0.3s ease, color 0.3s ease;
       }
       header {
-        background: #17202b;
-        padding: 1rem;
+        background: var(--header);
+        padding: 1.2rem 1.5rem;
         display: flex;
-        gap: 1rem;
+        gap: 0.75rem;
         align-items: center;
+        flex-wrap: wrap;
+        border-bottom: 1px solid var(--border);
+      }
+      header strong {
+        font-size: 1.15rem;
+        margin-right: auto;
       }
       main {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-        gap: 1rem;
-        padding: 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+        gap: 1.25rem;
+        padding: 1.5rem;
       }
-      section {
-        background: #1c2733;
-        border-radius: 8px;
+      section.card {
+        background: var(--card);
+        border-radius: 12px;
         padding: 1rem;
-        min-height: 200px;
+        min-height: 220px;
+        border: 1px solid var(--border);
+        box-shadow: 0 8px 24px rgba(15, 23, 42, 0.05);
         overflow: auto;
+        transition: background 0.3s ease, color 0.3s ease, border 0.3s ease;
       }
-      h2 {
-        margin-top: 0;
-        font-size: 1rem;
-        text-transform: uppercase;
-        letter-spacing: 0.08em;
+      section.card h3 {
+        font-weight: 700;
+        margin: 0 0 0.75rem;
+        letter-spacing: 0.02em;
       }
-      button, select, input {
-        background: #243447;
-        color: #f0f3f7;
-        border: 1px solid #2f4052;
-        padding: 0.4rem 0.6rem;
-        border-radius: 4px;
-        margin-right: 0.4rem;
+      button {
+        background: var(--primary);
+        color: #ffffff;
+        border: 1px solid transparent;
+        padding: 0.5rem 0.9rem;
+        border-radius: 8px;
+        font-size: 0.95rem;
+        display: inline-flex;
+        align-items: center;
+        gap: 0.4rem;
+        transition: background 0.2s ease, transform 0.1s ease, box-shadow 0.2s ease;
       }
-      button:hover { background: #2f4052; cursor: pointer; }
-      small { color: #8a9ba8; display: block; margin-top: 0.4rem; }
-      table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-      th, td { border-bottom: 1px solid #243447; padding: 0.3rem; text-align: left; }
-      pre { white-space: pre-wrap; word-break: break-word; }
+      button:hover {
+        background: var(--primary-hover);
+        cursor: pointer;
+      }
+      button:active {
+        transform: translateY(1px);
+      }
+      button:focus-visible {
+        outline: 3px solid rgba(59, 130, 246, 0.45);
+        outline-offset: 2px;
+      }
+      button.secondary {
+        background: transparent;
+        color: var(--text);
+        border-color: var(--border);
+      }
+      button.secondary:hover {
+        background: rgba(59, 130, 246, 0.12);
+      }
+      small {
+        color: var(--muted);
+        display: block;
+        margin-top: 0.4rem;
+        font-size: 0.85rem;
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.92rem;
+      }
+      th,
+      td {
+        border-bottom: 1px solid var(--border);
+        padding: 0.45rem 0;
+        text-align: left;
+      }
+      pre {
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
     </style>
   </head>
   <body>
     <header>
       <strong>Centrix Control</strong>
-      <button id="btn-pause">Pause</button>
-      <button id="btn-resume">Resume</button>
-      <button id="btn-mode">Toggle Mode</button>
-      <select id="svc-select">
-        <option value="tui">Restart TUI</option>
-        <option value="dashboard">Restart Dashboard</option>
-        <option value="worker">Restart Worker</option>
-      </select>
-      <button id="btn-restart">Restart</button>
-      <button id="btn-order">Test Order</button>
+      <button id="btn-pause" class="secondary">Pause</button>
+      <button id="btn-resume" class="secondary">Fortsetzen</button>
+      <button id="btn-mode">Modus wechseln</button>
+      <button id="btn-restart-tui" class="secondary">TUI neu starten</button>
+      <button id="btn-order">Test-Order</button>
+      <button id="btn-dark-mode" class="secondary">Dark Mode</button>
       <input id="token-input" placeholder="Token (optional)" aria-label="Dashboard token">
       <small id="status-indicator">Connecting…</small>
     </header>
     <main>
-      <section id="state-panel">
-        <h2>State</h2>
+      <section id="state-panel" class="card">
+        <h3>SYSTEMSTATUS</h3>
         <div id="state"></div>
       </section>
-      <section id="clients-panel">
-        <h2>Clients</h2>
+      <section id="clients-panel" class="card">
+        <h3>VERBINDUNGEN</h3>
         <div id="clients"></div>
       </section>
-      <section id="orders-panel">
-        <h2>Orders</h2>
+      <section id="orders-panel" class="card">
+        <h3>AUFTRÄGE</h3>
         <div id="orders"></div>
       </section>
-      <section id="events-panel">
-        <h2>Events</h2>
+      <section id="events-panel" class="card">
+        <h3>EREIGNISSE</h3>
         <div id="events"></div>
       </section>
     </main>
     <script>
       const indicator = document.getElementById('status-indicator');
       const tokenInput = document.getElementById('token-input');
+      const darkModeBtn = document.getElementById('btn-dark-mode');
       let currentToken = '';
       let ws = null;
       let pollInterval = null;
@@ -284,14 +354,11 @@ INDEX_HTML = """<!DOCTYPE html>
       document.getElementById('btn-pause').addEventListener('click', () => sendAction('pause'));
       document.getElementById('btn-resume').addEventListener('click', () => sendAction('resume'));
       document.getElementById('btn-mode').addEventListener('click', () => sendAction('mode'));
-      document
-        .getElementById('btn-order')
-        .addEventListener('click', () =>
-          sendAction('test-order', { symbol: 'DEMO', qty: 1, px: 0 }),
-        );
-      document.getElementById('btn-restart').addEventListener('click', () => {
-        const svc = document.getElementById('svc-select').value;
-        sendAction('restart', { service: svc });
+      document.getElementById('btn-order').addEventListener('click', () =>
+        sendAction('test-order', { symbol: 'DEMO', qty: 1, px: 0 }),
+      );
+      document.getElementById('btn-restart-tui').addEventListener('click', () => {
+        sendAction('restart', { service: 'tui' });
       });
       tokenInput.addEventListener('change', () => {
         currentToken = tokenInput.value.trim();
@@ -301,6 +368,13 @@ INDEX_HTML = """<!DOCTYPE html>
 
       openSocket();
       fetchStatus();
+
+      darkModeBtn.addEventListener('click', () => {
+        document.body.classList.toggle('dark');
+        darkModeBtn.textContent = document.body.classList.contains('dark')
+          ? 'Light Mode'
+          : 'Dark Mode';
+      });
     </script>
   </body>
 </html>
@@ -348,7 +422,10 @@ def _load_slack_selftest_detail() -> str | None:
     else:
         socket_summary = socket_info.get("code") or "fail"
 
-    return f"{status} {run_at} auth={auth_summary} posts={ok_channels}/{total_channels} socket={socket_summary}"
+    return (
+        f"{status} {run_at} auth={auth_summary} "
+        f"posts={ok_channels}/{total_channels} socket={socket_summary}"
+    )
 
 
 def status_payload() -> dict[str, Any]:
@@ -397,27 +474,63 @@ async def index() -> HTMLResponse:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, Any]:
-    bus = Bus(settings.ipc_db)
-    services = bus.get_services_status(SERVICE_NAMES)
-    ok = all(info.get("running") for info in services.values())
-    return {"ok": ok, "services": services}
+    services: dict[str, dict[str, Any]]
+    try:
+        bus = Bus(settings.ipc_db)
+        services = bus.get_services_status(SERVICE_NAMES)
+    except Exception as exc:  # pragma: no cover - defensive
+        services = {"error": {"message": str(exc)}}
+    return {
+        "ok": True,
+        "services": services,
+        "ts": datetime.now(UTC).isoformat(),
+    }
 
 
 @app.get("/metrics")
 async def metrics() -> dict[str, Any]:
-    data = status_payload()
-    return {
-        "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "kpi": data["kpi"],
-        "alerts": data.get("alerts", {}),
-        "services": data["services"],
-        "build": BUILD_INFO,
-    }
+    try:
+        data = status_payload()
+        return {
+            "ok": True,
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "kpi": data["kpi"],
+            "alerts": data.get("alerts", {}),
+            "services": data["services"],
+            "build": BUILD_INFO,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        log_event("dashboard", "metrics", "metrics error", level="ERROR", error=str(exc))
+        return {"ok": False, "error": str(exc)}
 
 
 @app.get("/api/status")
 async def api_status(_: None = Depends(_require_token)) -> JSONResponse:
-    return JSONResponse(status_payload())
+    try:
+        payload = status_payload()
+        payload["ok"] = True
+        return JSONResponse(payload)
+    except Exception as exc:  # pragma: no cover - defensive
+        log_event("dashboard", "api.status", "status error", level="ERROR", error=str(exc))
+        return JSONResponse({"ok": False, "error": str(exc)})
+
+
+def create_app() -> FastAPI:
+    return app
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    settings_override = AppSettings()
+
+    uvicorn.run(
+        "centrix.dashboard.server:create_app",
+        host=settings_override.dashboard_host,
+        port=settings_override.dashboard_port,
+        factory=True,
+        log_level="info",
+    )
 
 
 def _toggle_mode(current: dict[str, Any], value: str | None) -> dict[str, Any]:

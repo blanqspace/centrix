@@ -9,7 +9,12 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from slack_sdk.errors import SlackApiError, SlackClientError
+from slack_sdk.socket_mode import SocketModeClient
+from slack_sdk.web import WebClient
+from slack_sdk.web.slack_response import SlackResponse
 
 from centrix.cli import _parse_targets, _start_service, _stop_service
 from centrix.core import orders
@@ -72,17 +77,15 @@ def slack_env_summary() -> dict[str, Any]:
     }
 
 
-def slack_auth_test(client: Any) -> dict[str, Any]:
-    try:
-        from slack_sdk.errors import SlackApiError, SlackClientError  # type: ignore
-    except Exception:  # pragma: no cover - slack optional
-        SlackApiError = SlackClientError = Exception  # type: ignore[assignment]
-
-    error_types: tuple[type[BaseException], ...] = (SlackApiError, SlackClientError, Exception)
-
+def slack_auth_test(client: WebClient) -> dict[str, Any]:
     try:
         response = client.auth_test()
-        data = response.data if hasattr(response, "data") else dict(response)
+        if isinstance(response, SlackResponse):
+            data = cast(dict[str, Any], response.data)
+        elif isinstance(response, dict):
+            data = cast(dict[str, Any], response)
+        else:
+            data = {}
         ok = bool(data.get("ok"))
         return {
             "ok": ok,
@@ -91,20 +94,39 @@ def slack_auth_test(client: Any) -> dict[str, Any]:
             "error": None if ok else data.get("error"),
             "code": None if ok else data.get("error"),
         }
-    except error_types as exc:  # type: ignore[arg-type]
+    except (SlackApiError, SlackClientError) as exc:
         error_detail = None
         error_code = None
-        response = getattr(exc, "response", None)
-        if response is not None:
-            response_data = getattr(response, "data", None) or getattr(response, "body", None)
-            if isinstance(response_data, dict):
-                error_detail = response_data.get("error") or response_data.get("detail")
-                error_code = response_data.get("error")
+        error_response = getattr(exc, "response", None)
+        response_data: Any = None
+        if isinstance(error_response, SlackResponse):
+            response_data = error_response.data
+        else:
+            response_data = getattr(error_response, "data", None) or getattr(
+                error_response, "body", None
+            )
+        if isinstance(response_data, dict):
+            error_detail = response_data.get("error") or response_data.get("detail")
+            error_code = response_data.get("error")
         if not error_detail:
             error_detail = str(exc)
         if not error_code:
             error_code = "exception"
-        return {"ok": False, "user_id": None, "team": None, "error": error_detail, "code": error_code}
+        return {
+            "ok": False,
+            "user_id": None,
+            "team": None,
+            "error": error_detail,
+            "code": error_code,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "ok": False,
+            "user_id": None,
+            "team": None,
+            "error": str(exc),
+            "code": "exception",
+        }
 
 
 def socket_mode_probe() -> dict[str, Any]:
@@ -118,15 +140,12 @@ def socket_mode_probe() -> dict[str, Any]:
     if not settings.slack_bot_token:
         return {"ok": False, "error": "missing bot token", "code": "missing_bot_token"}
     try:
-        from slack_sdk.socket_mode import SocketModeClient
-        from slack_sdk.web import WebClient
-    except Exception as exc:  # pragma: no cover - slack optional
-        return {"ok": False, "error": f"import error: {exc}", "code": "import_error"}
-
-    client = SocketModeClient(
-        app_token=settings.slack_app_token,
-        web_client=WebClient(token=settings.slack_bot_token),
-    )
+        client = SocketModeClient(
+            app_token=settings.slack_app_token,
+            web_client=WebClient(token=settings.slack_bot_token),
+        )
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "code": "init_error"}
     try:
         client.connect()
         time.sleep(0.5)
@@ -138,22 +157,20 @@ def socket_mode_probe() -> dict[str, Any]:
         return {"ok": False, "error": str(exc), "code": "exception"}
     finally:
         try:
-            client.close()
+            cast(Any, client).close()
         except Exception:
             pass
 
 
-def post_probe(client: Any, channel: str, text: str) -> dict[str, Any]:
-    try:
-        from slack_sdk.errors import SlackApiError, SlackClientError  # type: ignore
-    except Exception:  # pragma: no cover - slack optional
-        SlackApiError = SlackClientError = Exception  # type: ignore[assignment]
-
-    error_types: tuple[type[BaseException], ...] = (SlackApiError, SlackClientError, Exception)
-
+def post_probe(client: WebClient, channel: str, text: str) -> dict[str, Any]:
     try:
         response = client.chat_postMessage(channel=channel, text=text)
-        data = response.data if hasattr(response, "data") else dict(response)
+        if isinstance(response, SlackResponse):
+            data = cast(dict[str, Any], response.data)
+        elif isinstance(response, dict):
+            data = cast(dict[str, Any], response)
+        else:
+            data = {}
         ok = bool(data.get("ok"))
         return {
             "ok": ok,
@@ -162,20 +179,39 @@ def post_probe(client: Any, channel: str, text: str) -> dict[str, Any]:
             "error": None if ok else data.get("error"),
             "code": None if ok else data.get("error"),
         }
-    except error_types as exc:  # type: ignore[arg-type]
+    except (SlackApiError, SlackClientError) as exc:
         error_detail = None
         error_code = None
-        response = getattr(exc, "response", None)
-        if response is not None:
-            response_data = getattr(response, "data", None) or getattr(response, "body", None)
-            if isinstance(response_data, dict):
-                error_detail = response_data.get("error") or response_data.get("detail")
-                error_code = response_data.get("error")
+        error_response = getattr(exc, "response", None)
+        response_data: Any = None
+        if isinstance(error_response, SlackResponse):
+            response_data = error_response.data
+        else:
+            response_data = getattr(error_response, "data", None) or getattr(
+                error_response, "body", None
+            )
+        if isinstance(response_data, dict):
+            error_detail = response_data.get("error") or response_data.get("detail")
+            error_code = response_data.get("error")
         if not error_detail:
             error_detail = str(exc)
         if not error_code:
             error_code = "exception"
-        return {"ok": False, "ts": None, "channel": channel, "error": error_detail, "code": error_code}
+        return {
+            "ok": False,
+            "ts": None,
+            "channel": channel,
+            "error": error_detail,
+            "code": error_code,
+        }
+    except Exception as exc:  # pragma: no cover - defensive
+        return {
+            "ok": False,
+            "ts": None,
+            "channel": channel,
+            "error": str(exc),
+            "code": "exception",
+        }
 
 
 def slack_selftest() -> dict[str, Any]:
@@ -197,7 +233,9 @@ def slack_selftest() -> dict[str, Any]:
         "signing_secret": _mask_secret(settings.slack_signing_secret),
     }
 
-    channel_pairs = [f"{kind}:{channel}" for kind, channel in channels_configured.items() if channel]
+    channel_pairs = [
+        f"{kind}:{channel}" for kind, channel in channels_configured.items() if channel
+    ]
     env_detail_base = (
         f"bot={masked_tokens['bot_token'] or '-'} "
         f"app={masked_tokens['app_token'] or '-'} "
@@ -237,7 +275,12 @@ def slack_selftest() -> dict[str, Any]:
         label: str | None = None,
         extra: dict[str, Any] | None = None,
     ) -> None:
-        entry: dict[str, Any] = {"check": label or step, "target": target, "ok": ok, "detail": detail}
+        entry: dict[str, Any] = {
+            "check": label or step,
+            "target": target,
+            "ok": ok,
+            "detail": detail,
+        }
         if code:
             entry["code"] = code
         if extra:
@@ -252,9 +295,22 @@ def slack_selftest() -> dict[str, Any]:
         if ok is False:
             error_code = code or "failure"
             errors.append(
-                {"step": step, "target": target, "code": error_code, "message": detail, **(extra or {})}
+                {
+                    "step": step,
+                    "target": target,
+                    "code": error_code,
+                    "message": detail,
+                    **(extra or {}),
+                }
             )
-            _log_error(step, error_code, f"{step} failed", target=target, detail=detail, **(extra or {}))
+            _log_error(
+                step,
+                error_code,
+                f"{step} failed",
+                target=target,
+                detail=detail,
+                **(extra or {}),
+            )
 
     precheck_ok = not precheck_failures
     if precheck_ok:
@@ -279,35 +335,21 @@ def slack_selftest() -> dict[str, Any]:
         "code": "skipped",
     }
     if precheck_ok:
-        try:
-            from slack_sdk.web import WebClient
-        except Exception as exc:  # pragma: no cover - slack optional
-            detail = f"error=slack_sdk_missing: slack_sdk missing ({exc})"
+        client = WebClient(token=settings.slack_bot_token)
+        auth_result = slack_auth_test(client)
+        if auth_result["ok"]:
+            detail = f"user={auth_result.get('user_id')} team={auth_result.get('team')}"
+            record_check("auth.test", "api.slack.com", True, detail, label="auth.test")
+        else:
+            detail = f"error={auth_result.get('code')}: {auth_result.get('error')}"
             record_check(
                 "auth.test",
                 "api.slack.com",
                 False,
                 detail,
-                code="slack_sdk_missing",
+                code=auth_result.get("code") or "auth_failed",
                 label="auth.test",
             )
-            auth_result = {"ok": False, "user_id": None, "team": None, "error": str(exc), "code": "slack_sdk_missing"}
-        else:
-            client = WebClient(token=settings.slack_bot_token)
-            auth_result = slack_auth_test(client)
-            if auth_result["ok"]:
-                detail = f"user={auth_result.get('user_id')} team={auth_result.get('team')}"
-                record_check("auth.test", "api.slack.com", True, detail, label="auth.test")
-            else:
-                detail = f"error={auth_result.get('code')}: {auth_result.get('error')}"
-                record_check(
-                    "auth.test",
-                    "api.slack.com",
-                    False,
-                    detail,
-                    code=auth_result.get("code") or "auth_failed",
-                    label="auth.test",
-                )
     else:
         record_check(
             "auth.test", "api.slack.com", None, "skipped (precondition failed)", label="auth.test"
@@ -326,7 +368,12 @@ def slack_selftest() -> dict[str, Any]:
                     extra={"kind": kind, "channel": None},
                 )
                 channel_results.append(
-                    {"kind": kind, "channel": None, "ok": None, "detail": "skipped (not configured)"}
+                    {
+                        "kind": kind,
+                        "channel": None,
+                        "ok": None,
+                        "detail": "skipped (not configured)",
+                    }
                 )
                 continue
             post_result = post_probe(client, channel, probe_text)
@@ -377,7 +424,12 @@ def slack_selftest() -> dict[str, Any]:
                 extra={"kind": kind, "channel": channel},
             )
             channel_results.append(
-                {"kind": kind, "channel": channel, "ok": None, "detail": msg}
+                {
+                    "kind": kind,
+                    "channel": channel,
+                    "ok": None,
+                    "detail": msg,
+                }
             )
 
     socket_result: dict[str, Any] = {"ok": None, "error": "skipped", "code": "skipped"}
@@ -463,8 +515,6 @@ class SlackOut:
         self._client: Any | None = None
         if not self.simulation and self.bot_token:
             try:
-                from slack_sdk.web import WebClient
-
                 self._client = WebClient(token=self.bot_token)
             except Exception as exc:  # pragma: no cover - slack optional
                 log_event(
@@ -803,8 +853,8 @@ class SlackService:
 
         app = App(token=bot_token)
 
-        @app.command("/cx")
-        def _cx_command(ack, body, respond):
+        @app.command("/cx")  # type: ignore[misc]
+        def _cx_command(ack: Any, body: Any, respond: Any) -> None:
             # immediate ack to avoid dispatch_failed
             ack()
             try:
@@ -816,8 +866,8 @@ class SlackService:
                 log_event("slack", "handler", "cx error", level="ERROR", error=str(exc))
                 respond("error processing command")
 
-        @app.action({"action_id": "confirm"})
-        def _confirm_action(ack, body, respond):
+        @app.action({"action_id": "confirm"})  # type: ignore[misc]
+        def _confirm_action(ack: Any, body: Any, respond: Any) -> None:
             ack()
             try:
                 user_id = (body.get("user") or {}).get("id") or ""
@@ -830,8 +880,8 @@ class SlackService:
                 log_event("slack", "handler", "confirm error", level="ERROR", error=str(exc))
                 respond("error")
 
-        @app.action({"action_id": "reject"})
-        def _reject_action(ack, body, respond):
+        @app.action({"action_id": "reject"})  # type: ignore[misc]
+        def _reject_action(ack: Any, body: Any, respond: Any) -> None:
             ack()
             try:
                 user_id = (body.get("user") or {}).get("id") or ""
@@ -849,6 +899,8 @@ class SlackService:
     def run(self) -> None:
         ensure_runtime_dirs()
         _install_signal_handlers()
+        mode = "sim" if self.out.simulation else "real"
+        log_event("slack", "start", "slack service starting", mode=mode)
         if self.out.simulation:
             self._run_simulation()
         else:
