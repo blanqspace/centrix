@@ -73,6 +73,69 @@ def version() -> None:
     typer.echo(__version__)
 
 
+@app.command("slack:selftest")
+def slack_selftest_cmd(report: bool = True) -> None:
+    """
+    Führt realen Slack-Test aus: auth.test und Posts in alle konfigurierten Kanäle.
+    Setze SLACK_ENABLED=1 und SLACK_SIMULATION=0. Bricht mit Code !=0 bei Fehlern ab.
+    """
+
+    from centrix.services.slack import slack_selftest
+
+    result = slack_selftest()
+    checks = result.get("checks", [])
+
+    rows: list[tuple[str, str, str, str]] = []
+    for entry in checks:
+        ok_value = entry.get("ok")
+        if ok_value is True:
+            ok_text = "yes"
+        elif ok_value is False:
+            ok_text = "no"
+        else:
+            ok_text = "skip"
+        detail = str(entry.get("detail") or "-").replace("\n", " ")
+        rows.append(
+            (
+                str(entry.get("check") or "-"),
+                str(entry.get("target") or "-"),
+                ok_text,
+                detail,
+            )
+        )
+
+    headers = ("Check", "Target", "OK", "Detail")
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, cell in enumerate(row):
+            widths[idx] = max(widths[idx], len(cell))
+
+    header_line = " ".join(header.ljust(widths[idx]) for idx, header in enumerate(headers))
+    divider = " ".join("-" * widths[idx] for idx in range(len(headers)))
+    typer.echo(header_line)
+    typer.echo(divider)
+    for row in rows:
+        line = " ".join(row[idx].ljust(widths[idx]) for idx in range(len(headers)))
+        typer.echo(line)
+    typer.echo(divider)
+
+    status = result.get("status") or ("PASS" if result.get("overall_ok") else "FAIL")
+    typer.echo(f"RESULT: {status}")
+
+    if report:
+        latest_report = Path("runtime/reports/slack_selftest.json")
+        latest_report.parent.mkdir(parents=True, exist_ok=True)
+        latest_report.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        result["report_latest_path"] = str(latest_report)
+
+    if not result.get("precheck_ok"):
+        raise typer.Exit(2)
+    if not result.get("overall_ok"):
+        raise typer.Exit(1)
+
+    raise typer.Exit(0)
+
+
 def _parse_targets(target: str) -> list[str]:
     value = target.strip().lower()
     if value == "all":

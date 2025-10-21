@@ -35,6 +35,423 @@ def _channel_or_default(value: str | None, fallback: str) -> str:
     return value or fallback
 
 
+def _mask_secret(value: str | None) -> str | None:
+    if not value:
+        return None
+    prefixes = ("xoxb-", "xapp-", "xoxp-", "xoxa-", "xoxr-")
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            return prefix + "****"
+    return value[:4] + "****"
+
+
+def _log_stage(step: str, message: str, **fields: Any) -> None:
+    log_event("slack", "selftest", message, level="INFO", step=step, **fields)
+
+
+def _log_error(step: str, code: str, message: str, **fields: Any) -> None:
+    log_event("slack", "selftest", message, level="ERROR", step=step, error=code, **fields)
+
+
+def slack_env_summary() -> dict[str, Any]:
+    settings = get_settings()
+    channels_present = {
+        "control": bool(settings.slack_channel_control),
+        "logs": bool(settings.slack_channel_logs),
+        "alerts": bool(settings.slack_channel_alerts),
+        "orders": bool(settings.slack_channel_orders),
+    }
+    return {
+        "enabled": bool(settings.slack_enabled),
+        "simulation": bool(settings.slack_simulation),
+        "has_app_token": bool(settings.slack_app_token),
+        "has_bot_token": bool(settings.slack_bot_token),
+        "has_signing": bool(settings.slack_signing_secret),
+        "channels_present": channels_present,
+        "role_map_count": len(settings.slack_role_map or {}),
+    }
+
+
+def slack_auth_test(client: Any) -> dict[str, Any]:
+    try:
+        from slack_sdk.errors import SlackApiError, SlackClientError  # type: ignore
+    except Exception:  # pragma: no cover - slack optional
+        SlackApiError = SlackClientError = Exception  # type: ignore[assignment]
+
+    error_types: tuple[type[BaseException], ...] = (SlackApiError, SlackClientError, Exception)
+
+    try:
+        response = client.auth_test()
+        data = response.data if hasattr(response, "data") else dict(response)
+        ok = bool(data.get("ok"))
+        return {
+            "ok": ok,
+            "user_id": data.get("user_id"),
+            "team": data.get("team"),
+            "error": None if ok else data.get("error"),
+            "code": None if ok else data.get("error"),
+        }
+    except error_types as exc:  # type: ignore[arg-type]
+        error_detail = None
+        error_code = None
+        response = getattr(exc, "response", None)
+        if response is not None:
+            response_data = getattr(response, "data", None) or getattr(response, "body", None)
+            if isinstance(response_data, dict):
+                error_detail = response_data.get("error") or response_data.get("detail")
+                error_code = response_data.get("error")
+        if not error_detail:
+            error_detail = str(exc)
+        if not error_code:
+            error_code = "exception"
+        return {"ok": False, "user_id": None, "team": None, "error": error_detail, "code": error_code}
+
+
+def socket_mode_probe() -> dict[str, Any]:
+    settings = get_settings()
+    if not settings.slack_enabled:
+        return {"ok": False, "error": "slack disabled", "code": "slack_disabled"}
+    if settings.slack_simulation:
+        return {"ok": False, "error": "simulation mode active", "code": "simulation_active"}
+    if not settings.slack_app_token:
+        return {"ok": False, "error": "missing app token", "code": "missing_app_token"}
+    if not settings.slack_bot_token:
+        return {"ok": False, "error": "missing bot token", "code": "missing_bot_token"}
+    try:
+        from slack_sdk.socket_mode import SocketModeClient
+        from slack_sdk.web import WebClient
+    except Exception as exc:  # pragma: no cover - slack optional
+        return {"ok": False, "error": f"import error: {exc}", "code": "import_error"}
+
+    client = SocketModeClient(
+        app_token=settings.slack_app_token,
+        web_client=WebClient(token=settings.slack_bot_token),
+    )
+    try:
+        client.connect()
+        time.sleep(0.5)
+        connected = getattr(client, "connected", True)
+        if not connected:
+            return {"ok": False, "error": "socket client did not connect", "code": "not_connected"}
+        return {"ok": True, "error": None, "code": None}
+    except Exception as exc:  # pragma: no cover - socket optional
+        return {"ok": False, "error": str(exc), "code": "exception"}
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def post_probe(client: Any, channel: str, text: str) -> dict[str, Any]:
+    try:
+        from slack_sdk.errors import SlackApiError, SlackClientError  # type: ignore
+    except Exception:  # pragma: no cover - slack optional
+        SlackApiError = SlackClientError = Exception  # type: ignore[assignment]
+
+    error_types: tuple[type[BaseException], ...] = (SlackApiError, SlackClientError, Exception)
+
+    try:
+        response = client.chat_postMessage(channel=channel, text=text)
+        data = response.data if hasattr(response, "data") else dict(response)
+        ok = bool(data.get("ok"))
+        return {
+            "ok": ok,
+            "ts": data.get("ts"),
+            "channel": channel,
+            "error": None if ok else data.get("error"),
+            "code": None if ok else data.get("error"),
+        }
+    except error_types as exc:  # type: ignore[arg-type]
+        error_detail = None
+        error_code = None
+        response = getattr(exc, "response", None)
+        if response is not None:
+            response_data = getattr(response, "data", None) or getattr(response, "body", None)
+            if isinstance(response_data, dict):
+                error_detail = response_data.get("error") or response_data.get("detail")
+                error_code = response_data.get("error")
+        if not error_detail:
+            error_detail = str(exc)
+        if not error_code:
+            error_code = "exception"
+        return {"ok": False, "ts": None, "channel": channel, "error": error_detail, "code": error_code}
+
+
+def slack_selftest() -> dict[str, Any]:
+    ensure_runtime_dirs()
+    run_at = datetime.now(tz=UTC).isoformat(timespec="seconds")
+    _log_stage("start", "starting slack selftest", ts=run_at)
+
+    settings = get_settings()
+    env = slack_env_summary()
+    channels_configured = {
+        "control": settings.slack_channel_control,
+        "logs": settings.slack_channel_logs,
+        "alerts": settings.slack_channel_alerts,
+        "orders": settings.slack_channel_orders,
+    }
+    masked_tokens = {
+        "bot_token": _mask_secret(settings.slack_bot_token),
+        "app_token": _mask_secret(settings.slack_app_token),
+        "signing_secret": _mask_secret(settings.slack_signing_secret),
+    }
+
+    channel_pairs = [f"{kind}:{channel}" for kind, channel in channels_configured.items() if channel]
+    env_detail_base = (
+        f"bot={masked_tokens['bot_token'] or '-'} "
+        f"app={masked_tokens['app_token'] or '-'} "
+        f"signing={'yes' if env['has_signing'] else 'no'} "
+        f"channels={','.join(channel_pairs) if channel_pairs else '-'}"
+    )
+
+    precheck_failures: list[tuple[str, str]] = []
+    if not env["enabled"]:
+        precheck_failures.append(
+            ("slack_disabled", "Slack integration disabled (SLACK_ENABLED must be 1)")
+        )
+    if env["simulation"]:
+        precheck_failures.append(
+            ("simulation_active", "Slack simulation mode active (set SLACK_SIMULATION=0)")
+        )
+    if not env["has_bot_token"]:
+        precheck_failures.append(("missing_bot_token", "Missing bot token (SLACK_BOT_TOKEN)"))
+    if not env["has_app_token"]:
+        precheck_failures.append(("missing_app_token", "Missing app token (SLACK_APP_TOKEN)"))
+    if not env["has_signing"]:
+        precheck_failures.append(
+            ("missing_signing_secret", "Missing signing secret (SLACK_SIGNING_SECRET)")
+        )
+
+    checks: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    channel_results: list[dict[str, Any]] = []
+
+    def record_check(
+        step: str,
+        target: str,
+        ok: bool | None,
+        detail: str,
+        *,
+        code: str | None = None,
+        label: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {"check": label or step, "target": target, "ok": ok, "detail": detail}
+        if code:
+            entry["code"] = code
+        if extra:
+            entry.update(extra)
+        checks.append(entry)
+        status_map = {True: "ok", False: "failed", None: "skipped"}
+        status = status_map.get(ok, "unknown")
+        log_fields = {"target": target, "detail": detail, "ok": ok}
+        if extra:
+            log_fields.update(extra)
+        _log_stage(step, f"{step} {status}", **log_fields)
+        if ok is False:
+            error_code = code or "failure"
+            errors.append(
+                {"step": step, "target": target, "code": error_code, "message": detail, **(extra or {})}
+            )
+            _log_error(step, error_code, f"{step} failed", target=target, detail=detail, **(extra or {}))
+
+    precheck_ok = not precheck_failures
+    if precheck_ok:
+        record_check("environment", "tokens/channels", True, env_detail_base, label="env")
+    else:
+        failure_detail = "; ".join(f"error={code}: {msg}" for code, msg in precheck_failures)
+        record_check(
+            "environment",
+            "tokens/channels",
+            False,
+            f"{env_detail_base}; {failure_detail}",
+            code=precheck_failures[0][0],
+            label="env",
+        )
+
+    client: Any | None = None
+    auth_result: dict[str, Any] = {
+        "ok": None,
+        "user_id": None,
+        "team": None,
+        "error": "skipped",
+        "code": "skipped",
+    }
+    if precheck_ok:
+        try:
+            from slack_sdk.web import WebClient
+        except Exception as exc:  # pragma: no cover - slack optional
+            detail = f"error=slack_sdk_missing: slack_sdk missing ({exc})"
+            record_check(
+                "auth.test",
+                "api.slack.com",
+                False,
+                detail,
+                code="slack_sdk_missing",
+                label="auth.test",
+            )
+            auth_result = {"ok": False, "user_id": None, "team": None, "error": str(exc), "code": "slack_sdk_missing"}
+        else:
+            client = WebClient(token=settings.slack_bot_token)
+            auth_result = slack_auth_test(client)
+            if auth_result["ok"]:
+                detail = f"user={auth_result.get('user_id')} team={auth_result.get('team')}"
+                record_check("auth.test", "api.slack.com", True, detail, label="auth.test")
+            else:
+                detail = f"error={auth_result.get('code')}: {auth_result.get('error')}"
+                record_check(
+                    "auth.test",
+                    "api.slack.com",
+                    False,
+                    detail,
+                    code=auth_result.get("code") or "auth_failed",
+                    label="auth.test",
+                )
+    else:
+        record_check(
+            "auth.test", "api.slack.com", None, "skipped (precondition failed)", label="auth.test"
+        )
+
+    probe_text = f"Centrix selftest OK {run_at}"
+    if client and auth_result.get("ok"):
+        for kind, channel in channels_configured.items():
+            if not channel:
+                record_check(
+                    "post",
+                    kind.upper(),
+                    None,
+                    "skipped (not configured)",
+                    label="post",
+                    extra={"kind": kind, "channel": None},
+                )
+                channel_results.append(
+                    {"kind": kind, "channel": None, "ok": None, "detail": "skipped (not configured)"}
+                )
+                continue
+            post_result = post_probe(client, channel, probe_text)
+            if post_result["ok"]:
+                detail = f"ts={post_result.get('ts')}"
+                record_check(
+                    "post",
+                    kind.upper(),
+                    True,
+                    detail,
+                    label="post",
+                    extra={"kind": kind, "channel": channel},
+                )
+            else:
+                detail = f"error={post_result.get('code')}: {post_result.get('error')}"
+                record_check(
+                    "post",
+                    kind.upper(),
+                    False,
+                    detail,
+                    code=post_result.get("code") or "post_failed",
+                    label="post",
+                    extra={"kind": kind, "channel": channel},
+                )
+            channel_results.append(
+                {
+                    "kind": kind,
+                    "channel": channel,
+                    "ok": post_result["ok"],
+                    "ts": post_result.get("ts"),
+                    "error": post_result.get("error"),
+                    "code": post_result.get("code"),
+                    "detail": detail,
+                }
+            )
+    else:
+        for kind, channel in channels_configured.items():
+            if channel:
+                msg = "skipped (auth.test failed)"
+            else:
+                msg = "skipped (not configured)"
+            record_check(
+                "post",
+                kind.upper(),
+                None,
+                msg,
+                label="post",
+                extra={"kind": kind, "channel": channel},
+            )
+            channel_results.append(
+                {"kind": kind, "channel": channel, "ok": None, "detail": msg}
+            )
+
+    socket_result: dict[str, Any] = {"ok": None, "error": "skipped", "code": "skipped"}
+    if precheck_ok:
+        if env["has_app_token"]:
+            socket_result = socket_mode_probe()
+            if socket_result["ok"]:
+                record_check(
+                    "socket-mode",
+                    "xapp handshake",
+                    True,
+                    "connected",
+                    label="socket-mode",
+                )
+            else:
+                detail = f"error={socket_result.get('code')}: {socket_result.get('error')}"
+                record_check(
+                    "socket-mode",
+                    "xapp handshake",
+                    False,
+                    detail,
+                    code=socket_result.get("code") or "socket_failed",
+                    label="socket-mode",
+                )
+        else:
+            record_check(
+                "socket-mode",
+                "xapp handshake",
+                None,
+                "skipped (missing app token)",
+                label="socket-mode",
+            )
+    else:
+        record_check(
+            "socket-mode",
+            "xapp handshake",
+            None,
+            "skipped (precondition failed)",
+            label="socket-mode",
+        )
+
+    posts_ok = all(
+        entry.get("ok") in (True, None) for entry in channel_results if entry.get("channel")
+    )
+    socket_ok = socket_result.get("ok") in (True, None)
+    overall_ok = bool(precheck_ok and auth_result.get("ok") and posts_ok and socket_ok)
+
+    status = "PASS" if overall_ok else "FAIL"
+    _log_stage("result", f"selftest result {status.lower()}", status=status, errors=len(errors))
+
+    report_payload = {
+        "run_at": run_at,
+        "precheck_ok": precheck_ok,
+        "precheck_failures": precheck_failures,
+        "overall_ok": overall_ok,
+        "status": status,
+        "summary": env,
+        "checks": checks,
+        "auth": auth_result,
+        "channels": channel_results,
+        "socket_mode": socket_result,
+        "errors": errors,
+        "masked_tokens": masked_tokens,
+    }
+
+    report_dir = Path("runtime/reports")
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / f"slack_selftest_{run_at.replace(':', '').replace('-', '')}.json"
+    report_path.write_text(json.dumps(report_payload, indent=2), encoding="utf-8")
+    report_payload["report_path"] = str(report_path)
+    _log_stage("finish", "selftest finished", status=status, report=str(report_path))
+    return report_payload
+
+
 @dataclass
 class SlackOut:
     """Outbound Slack helper supporting simulation and real transport."""
@@ -72,7 +489,6 @@ class SlackOut:
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Dispatch a message either to simulation log or Slack."""
-
         payload = {
             "ts": _now_iso(),
             "channel": channel,
@@ -108,7 +524,6 @@ class SlackOut:
 
 def get_slack_out() -> SlackOut:
     """Return a module-wide SlackOut instance."""
-
     global _SLACK_OUT
     if _SLACK_OUT is not None:
         return _SLACK_OUT
@@ -167,7 +582,6 @@ def _ensure_role(action: str, user_id: str) -> tuple[bool, str]:
 
 def handle_slash_command(user_id: str, text: str) -> dict[str, Any]:
     """Handle `/cx` style slash commands."""
-
     parts = [segment for segment in text.strip().split() if segment]
     if not parts:
         return {"text": "Usage: /cx [status|pause|resume|mode|order|restart]"}
@@ -294,7 +708,6 @@ def handle_button(
     token: str | None = None,
 ) -> dict[str, Any]:
     """Process interactive button callbacks."""
-
     if action_id == "confirm":
         ok, reason = _ensure_role("confirm", user)
         if not ok:
@@ -327,11 +740,10 @@ def handle_button(
 
 def route_alert(level: str, topic: str, message: str, **fields: Any) -> None:
     """Dispatch alerts to Slack once minimum level is met."""
-
     settings = get_settings()
+    levels = ["DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"]
     if not settings.slack_enabled:
         return
-    levels = ["DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"]
     try:
         min_idx = levels.index(settings.alert_min_level.upper())
         level_idx = levels.index(level.upper())
@@ -358,14 +770,16 @@ class SlackService:
             log_event("slack", "heartbeat", "slack simulation alive")
             time.sleep(interval)
 
-    def _run_socket_mode(self) -> None:  # pragma: no cover - requires slack_sdk
+    def _run_socket_mode(self) -> None:  # pragma: no cover - requires slack_bolt/slack_sdk
+        # Hard dependency only when enabled.
         try:
-            import slack_sdk  # noqa: F401
+            from slack_bolt import App
+            from slack_bolt.adapter.socket_mode import SocketModeHandler
         except Exception as exc:
             log_event(
                 "slack",
                 "socket_mode",
-                "slack_sdk unavailable, using simulation",
+                "slack_bolt unavailable, using simulation",
                 level="WARN",
                 error=str(exc),
             )
@@ -373,13 +787,64 @@ class SlackService:
             self._run_simulation()
             return
 
-        log_event(
-            "slack",
-            "socket_mode",
-            "socket-mode support deferred to simulation in this build",
-            level="WARN",
-        )
-        self._run_simulation()
+        # Tokens from settings
+        bot_token = self.settings.slack_bot_token
+        app_token = self.settings.slack_app_token
+        if not bot_token or not app_token:
+            log_event(
+                "slack",
+                "socket_mode",
+                "missing tokens, switching to simulation",
+                level="WARN",
+            )
+            self.out.simulation = True
+            self._run_simulation()
+            return
+
+        app = App(token=bot_token)
+
+        @app.command("/cx")
+        def _cx_command(ack, body, respond):
+            # immediate ack to avoid dispatch_failed
+            ack()
+            try:
+                user_id = body.get("user_id") or ""
+                text = (body.get("text") or "help").strip()
+                resp = handle_slash_command(user_id=user_id, text=text)
+                respond(resp.get("text", "ok"))
+            except Exception as exc:  # defensive
+                log_event("slack", "handler", "cx error", level="ERROR", error=str(exc))
+                respond("error processing command")
+
+        @app.action({"action_id": "confirm"})
+        def _confirm_action(ack, body, respond):
+            ack()
+            try:
+                user_id = (body.get("user") or {}).get("id") or ""
+                meta = (body.get("message") or {}).get("metadata") or {}
+                order_id = int(meta.get("order_id") or 0)
+                token = meta.get("token")
+                resp = handle_button("confirm", user=user_id, order_id=order_id, token=token)
+                respond(resp.get("text", "ok"))
+            except Exception as exc:
+                log_event("slack", "handler", "confirm error", level="ERROR", error=str(exc))
+                respond("error")
+
+        @app.action({"action_id": "reject"})
+        def _reject_action(ack, body, respond):
+            ack()
+            try:
+                user_id = (body.get("user") or {}).get("id") or ""
+                meta = (body.get("message") or {}).get("metadata") or {}
+                order_id = int(meta.get("order_id") or 0)
+                resp = handle_button("reject", user=user_id, order_id=order_id, token=None)
+                respond(resp.get("text", "ok"))
+            except Exception as exc:
+                log_event("slack", "handler", "reject error", level="ERROR", error=str(exc))
+                respond("error")
+
+        log_event("slack", "startup", "slack socket-mode starting")
+        SocketModeHandler(app, app_token).start()
 
     def run(self) -> None:
         ensure_runtime_dirs()

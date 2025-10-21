@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import secrets
 import sys
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from fastapi import (
@@ -314,10 +316,51 @@ def _require_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="unauthorized")
 
 
+def _load_slack_selftest_detail() -> str | None:
+    report_path = Path("runtime/reports/slack_selftest.json")
+    if not report_path.exists():
+        return None
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "slack selftest report unreadable"
+
+    status = payload.get("status") or ("PASS" if payload.get("overall_ok") else "FAIL")
+    run_at = payload.get("run_at") or "-"
+
+    auth_info = payload.get("auth") or {}
+    if auth_info.get("ok") is True:
+        auth_summary = "ok"
+    elif auth_info.get("ok") is None:
+        auth_summary = "skip"
+    else:
+        auth_summary = auth_info.get("code") or "fail"
+
+    channels = payload.get("channels") or []
+    total_channels = sum(1 for item in channels if item.get("channel"))
+    ok_channels = sum(1 for item in channels if item.get("channel") and item.get("ok") is True)
+
+    socket_info = payload.get("socket_mode") or {}
+    if socket_info.get("ok") is True:
+        socket_summary = "ok"
+    elif socket_info.get("ok") is None:
+        socket_summary = "skip"
+    else:
+        socket_summary = socket_info.get("code") or "fail"
+
+    return f"{status} {run_at} auth={auth_summary} posts={ok_channels}/{total_channels} socket={socket_summary}"
+
+
 def status_payload() -> dict[str, Any]:
     bus = Bus(settings.ipc_db)
     state = read_state()
     services = bus.get_services_status(SERVICE_NAMES)
+    slack_detail = _load_slack_selftest_detail()
+    if slack_detail is not None:
+        if "slack" in services and isinstance(services["slack"], dict):
+            services["slack"]["detail"] = slack_detail
+        else:
+            services["slack"] = {"detail": slack_detail}
     kpi = snapshot_kpis()
     orders = list_orders()
     events = bus.tail_events(limit=EVENT_LIMIT)
