@@ -2,30 +2,32 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import signal
 import sys
 import time
+from threading import Event, Thread
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from http.client import HTTPConnection, HTTPSConnection, HTTPException
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlparse
+import socket
+import traceback
 
 from slack_sdk.errors import SlackApiError, SlackClientError
 from slack_sdk.socket_mode import SocketModeClient
 from slack_sdk.web import WebClient
 from slack_sdk.web.slack_response import SlackResponse
 
-from centrix.cli import _parse_targets, _start_service, _stop_service
-from centrix.core import orders
 from centrix.core.approvals import confirm as approve_order
 from centrix.core.approvals import reject as reject_order
-from centrix.core.approvals import request_approval
 from centrix.core.logging import ensure_runtime_dirs, log_event, warn_on_local_env
-from centrix.core.metrics import METRICS
 from centrix.core.rbac import allow, role_of
-from centrix.ipc import read_state, write_state
+from centrix.ipc import epoch_ms
 from centrix.ipc.bus import Bus
 from centrix.settings import get_settings
 
@@ -57,6 +59,223 @@ def _log_stage(step: str, message: str, **fields: Any) -> None:
 
 def _log_error(step: str, code: str, message: str, **fields: Any) -> None:
     log_event("slack", "selftest", message, level="ERROR", step=step, error=code, **fields)
+
+
+def _dashboard_base_url() -> str:
+    settings = get_settings()
+    host = settings.dashboard_host or "127.0.0.1"
+    port = settings.dashboard_port
+    return f"http://{host}:{port}"
+
+
+def _encode_basic_auth(user_id: str, role: str) -> str:
+    credentials = f"{user_id}:{role}".encode("utf-8")
+    token = base64.b64encode(credentials).decode("ascii")
+    return f"Basic {token}"
+
+
+def _dashboard_request(
+    method: str,
+    path: str,
+    *,
+    user_id: str,
+    role: str,
+    payload: Mapping[str, Any] | None = None,
+    connect_timeout: float = 2.5,
+    read_timeout: float = 5.0,
+) -> tuple[bool, dict[str, Any] | None, str, int]:
+    """Call dashboard API using shared Basic Auth credentials."""
+
+    url = f"{_dashboard_base_url()}{path}"
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(f"invalid dashboard url: {url}")
+
+    headers = {"Authorization": _encode_basic_auth(user_id, role)}
+    body_data: str | None = None
+    if payload is not None:
+        body_data = json.dumps(dict(payload))
+        headers["Content-Type"] = "application/json"
+
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    connection_cls = HTTPSConnection if parsed.scheme == "https" else HTTPConnection
+    connection = connection_cls(parsed.hostname, port, timeout=connect_timeout)
+
+    path_with_query = parsed.path or "/"
+    if parsed.query:
+        path_with_query = f"{path_with_query}?{parsed.query}"
+
+    try:
+        connection.request(method, path_with_query, body=body_data, headers=headers)
+    except (socket.timeout, OSError, HTTPException) as exc:
+        connection.close()
+        reason = "timeout" if isinstance(exc, socket.timeout) else str(exc)
+        return False, None, reason, 504 if isinstance(exc, socket.timeout) else 503
+
+    try:
+        if connection.sock is not None:
+            connection.sock.settimeout(read_timeout)
+        response = connection.getresponse()
+        status = response.status
+        resp_body = response.read()
+    except socket.timeout:
+        connection.close()
+        return False, None, "timeout", 504
+    except (HTTPException, OSError) as exc:
+        connection.close()
+        return False, None, str(exc), 502
+    finally:
+        connection.close()
+
+    if not resp_body:
+        payload_obj: dict[str, Any] = {}
+    else:
+        try:
+            parsed_body = json.loads(resp_body.decode("utf-8"))
+            payload_obj = parsed_body if isinstance(parsed_body, dict) else {}
+        except json.JSONDecodeError:
+            payload_obj = {}
+
+    if status >= 400:
+        reason = payload_obj.get("detail") if isinstance(payload_obj, dict) else ""
+        if not reason:
+            reason = getattr(response, "reason", "") or f"http {status}"
+        return False, payload_obj, str(reason), status
+    return True, payload_obj, "", status
+
+
+def _status_api_call(
+    user_id: str, role: str
+) -> tuple[bool, dict[str, Any] | None, str, int]:
+    return _dashboard_request("GET", "/api/status", user_id=user_id, role=role)
+
+
+def _control_api_call(
+    action: str,
+    *,
+    user_id: str,
+    role: str,
+    extra: Mapping[str, Any] | None = None,
+) -> tuple[bool, dict[str, Any] | None, str, int]:
+    payload = {"action": action}
+    if extra:
+        payload.update(extra)
+    return _dashboard_request(
+        "POST",
+        "/api/control",
+        user_id=user_id,
+        role=role,
+        payload=payload,
+    )
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_user_ref(user: str | None) -> str:
+    if user and user.startswith("U"):
+        return f"<@{user}>"
+    return user or "system"
+
+
+def _format_status_blocks(snapshot: Mapping[str, Any]) -> tuple[str, list[dict[str, Any]]]:
+    mode = str(snapshot.get("mode") or "?")
+    paused = "yes" if bool(snapshot.get("paused")) else "no"
+    heartbeat = str(snapshot.get("heartbeat") or snapshot.get("ts") or "-")
+    connectivity = snapshot.get("connectivity")
+    if isinstance(connectivity, Mapping):
+        connectivity_items = ", ".join(f"{k}:{v}" for k, v in connectivity.items())
+        slack_status = connectivity.get("slack", "unknown")
+    else:
+        connectivity_items = "unavailable"
+        slack_status = "unknown"
+    risk = snapshot.get("risk") if isinstance(snapshot.get("risk"), Mapping) else {}
+    pnl_day = _safe_float(getattr(risk, "get", lambda _: 0.0)("pnl_day"), 0.0)
+    pnl_open = _safe_float(getattr(risk, "get", lambda _: 0.0)("pnl_open"), 0.0)
+    margin_used = _safe_float(getattr(risk, "get", lambda _: 0.0)("margin_used_pct"), 0.0)
+    text_fallback = (
+        f"mode={mode} paused={paused} slack={slack_status} pnl_day={pnl_day:.2f} margin={margin_used:.1f}%"
+    )
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "Centrix System Snapshot", "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Mode:* `{mode}`   •   *Paused:* `{paused}`\n*Heartbeat:* `{heartbeat}`",
+            },
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Connectivity:* {connectivity_items}"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*PnL Day*\n{pnl_day:.2f}"},
+                {"type": "mrkdwn", "text": f"*PnL Open*\n{pnl_open:.2f}"},
+                {"type": "mrkdwn", "text": f"*Margin Used*\n{margin_used:.1f}%"},
+            ],
+        },
+    ]
+    last_action = snapshot.get("last_action")
+    if isinstance(last_action, Mapping) and last_action.get("action"):
+        user_ref = _format_user_ref(str(last_action.get("user") or ""))
+        action_text = str(last_action.get("action"))
+        ts = str(last_action.get("ts") or "-")
+        blocks.append(
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"*Last Action:* `{action_text}` by {user_ref} · {ts}",
+                    }
+                ],
+            }
+        )
+    return text_fallback, blocks
+
+
+def _control_update_message(action: str, user_id: str, snapshot: Mapping[str, Any]) -> str:
+    mode = str(snapshot.get("mode") or "?")
+    paused = "paused" if bool(snapshot.get("paused")) else "active"
+    slack_status = "-"
+    connectivity = snapshot.get("connectivity")
+    if isinstance(connectivity, Mapping):
+        slack_status = str(connectivity.get("slack", "unknown"))
+    user_ref = _format_user_ref(user_id)
+    return (
+        f"{action.title()} requested by {user_ref} → mode={mode}, state={paused}, slack={slack_status}"
+    )
+
+
+def _order_announcement(
+    user_id: str, order_info: Mapping[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    order_id = order_info.get("id")
+    symbol = order_info.get("symbol", "-")
+    qty = order_info.get("qty", "-")
+    px = order_info.get("px", "-")
+    token = order_info.get("token")
+    user_ref = _format_user_ref(user_id)
+    text = (
+        f"Order #{order_id} {symbol} qty={qty} px={px} initiated by {user_ref}. "
+        f"Token: {token or '-'}"
+    )
+    metadata = {
+        "order_id": order_id,
+        "token": token,
+        "type": "order.submit",
+    }
+    return text, metadata
 
 
 def slack_env_summary() -> dict[str, Any]:
@@ -562,13 +781,43 @@ class SlackOut:
 
         if self._client is None:  # pragma: no cover - defensive
             raise RuntimeError("Slack WebClient not initialised.")
-        response = self._client.chat_postMessage(
-            channel=channel,
-            text=text,
-            blocks=blocks,
-            thread_ts=thread_ts,
-            metadata=metadata,
-        )
+        try:
+            response = self._client.chat_postMessage(
+                channel=channel,
+                text=text,
+                blocks=blocks,
+                thread_ts=thread_ts,
+                metadata=metadata,
+            )
+        except (SlackApiError, SlackClientError) as exc:
+            reason = None
+            if getattr(exc, "response", None) is not None:
+                data = getattr(exc.response, "data", None)
+                if isinstance(data, dict):
+                    reason = data.get("error") or data.get("detail")
+            if not reason:
+                reason = str(exc)
+            log_event(
+                "slack",
+                "post.error",
+                "failed to post slack message",
+                level="ERROR",
+                channel=channel,
+                reason=reason,
+            )
+            return {"ok": False, "channel": channel, "error": reason}
+        except Exception as exc:  # pragma: no cover - defensive
+            reason = str(exc)
+            log_event(
+                "slack",
+                "post.error",
+                "failed to post slack message",
+                level="ERROR",
+                channel=channel,
+                reason=reason,
+            )
+            return {"ok": False, "channel": channel, "error": reason}
+
         log_event("slack", "outbound", "message posted", channel=channel)
         return dict(response.data)
 
@@ -588,6 +837,63 @@ def get_slack_out() -> SlackOut:
     return _SLACK_OUT
 
 
+def _control_notification_text(payload: Mapping[str, Any]) -> str:
+    action = str(payload.get("action") or "?")
+    status = str(payload.get("status") or "unknown").upper()
+    ts = str(payload.get("ts") or _now_iso())
+    user = payload.get("user")
+    role = payload.get("role")
+    parts = [f"Control {action}", f"status={status}", f"ts={ts}"]
+    if user:
+        parts.append(f"user={_format_user_ref(str(user))}")
+    if role:
+        parts.append(f"role={str(role)}")
+    return " ".join(parts)
+
+
+def dispatch_notifications(
+    out: SlackOut,
+    bus: Bus,
+    last_event_id: int | None = None,
+) -> int:
+    """Deliver pending slack.notify events to Slack control channel."""
+
+    current_id = last_event_id or 0
+    events = bus.tail_events(limit=100, topic="slack.notify")
+    new_events = [evt for evt in events if evt["id"] > current_id]
+    if not new_events:
+        return current_id
+    for event in new_events:
+        data = event.get("data")
+        if not isinstance(data, Mapping):
+            continue
+        if data.get("type") == "control-action":
+            text = _control_notification_text(data)
+            out.post_message(channel_for("control"), text, metadata={"type": "control"})
+    current_id = max(evt["id"] for evt in new_events)
+    return current_id
+
+
+def run_selftest_cycle(out: SlackOut, bus: Bus) -> dict[str, Any]:
+    """Execute the Slack selftest, post summary, and update bus detail."""
+
+    result = slack_selftest()
+    run_at = result.get("run_at") or _now_iso()
+    status = str(result.get("status") or ("PASS" if result.get("overall_ok") else "FAIL"))
+    healthy = bool(result.get("overall_ok"))
+    detail = f"{'up' if healthy else 'down'} selftest {status} {run_at}"
+    bus.set_service_detail("slack", detail)
+    bus.record_heartbeat("slack", epoch_ms())
+
+    latest_report = Path("runtime/reports/slack_selftest.json")
+    latest_report.parent.mkdir(parents=True, exist_ok=True)
+    latest_report.write_text(json.dumps(result, indent=2), encoding="utf-8")
+
+    summary = f"Slack selftest {status} ({'OK' if healthy else 'FAIL'}) at {run_at}"
+    out.post_message(channel_for("logs"), summary, metadata={"type": "selftest"})
+    return result
+
+
 def channel_for(kind: str) -> str:
     settings = get_settings()
     default_channel = settings.slack_channel_logs or "#centrix"
@@ -598,21 +904,6 @@ def channel_for(kind: str) -> str:
         "orders": settings.slack_channel_orders or default_channel,
     }
     return mapping.get(kind, default_channel)
-
-
-def _service_status_summary() -> str:
-    bus = Bus(get_settings().ipc_db)
-    snapshot = bus.get_services_status(["tui", "dashboard", "worker", "slack"])
-    parts = []
-    for name, info in snapshot.items():
-        status = "running" if info.get("running") else "stopped"
-        parts.append(f"{name}:{status}")
-    state = read_state()
-    paused = "paused" if state.get("paused") else "active"
-    mode = state.get("mode")
-    parts.append(f"mode={mode}")
-    parts.append(f"state={paused}")
-    return ", ".join(parts)
 
 
 def _ensure_role(action: str, user_id: str) -> tuple[bool, str]:
@@ -631,124 +922,248 @@ def _ensure_role(action: str, user_id: str) -> tuple[bool, str]:
     return (True, "")
 
 
-def handle_slash_command(user_id: str, text: str) -> dict[str, Any]:
+def _help_text() -> str:
+    return (
+        "Centrix commands:\n"
+        "• /cx status\n"
+        "• /cx pause | /cx resume\n"
+        "• /cx mode [mock|real]\n"
+        "• /cx restart <service>\n"
+        "• /cx order <SYMBOL> <QTY> <PX>\n"
+        "• /cx help"
+    )
+
+
+def _ephemeral_payload(
+    text: str, *, blocks: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"response_type": "ephemeral", "text": text}
+    if blocks:
+        payload["blocks"] = blocks
+    return payload
+
+
+def _dashboard_error_message(reason: str, status: int) -> str:
+    if reason == "timeout" or status == 504:
+        return "dashboard timeout"
+    if not reason:
+        return f"dashboard error ({status})"
+    return f"dashboard error ({status}): {reason}"
+
+
+def handle_slash_command(
+    *,
+    user_id: str,
+    channel: str,
+    text: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Handle `/cx` style slash commands."""
-    parts = [segment for segment in text.strip().split() if segment]
-    if not parts:
-        return {"text": "Usage: /cx [status|pause|resume|mode|order|restart]"}
 
-    action = parts[0].lower()
-    ok, reason = _ensure_role(action if action != "mode" else "mode", user_id)
-    if not ok:
-        return {"text": reason}
+    tokens = [segment for segment in text.strip().split() if segment]
+    if not tokens:
+        return _ephemeral_payload(_help_text()), {"ok": True, "action": "help", "http_status": 200}
 
-    if action == "status":
-        summary = _service_status_summary()
-        get_slack_out().post_message(channel_for("control"), summary)
-        METRICS.increment_counter("control.actions_total")
-        return {"text": summary}
+    command = tokens[0].lower()
+    if command in {"help", "?"}:
+        return _ephemeral_payload(_help_text()), {"ok": True, "action": "help", "http_status": 200}
 
-    if action == "pause":
-        write_state(paused=True)
-        get_slack_out().post_message(channel_for("control"), "System paused.")
-        log_event("slack", "control.pause", "pause requested", user=user_id)
-        METRICS.increment_counter("control.actions_total")
-        return {"text": "Paused orchestration."}
+    role = role_of(user_id)
 
-    if action == "resume":
-        write_state(paused=False)
-        get_slack_out().post_message(channel_for("control"), "System resumed.")
-        log_event("slack", "control.resume", "resume requested", user=user_id)
-        METRICS.increment_counter("control.actions_total")
-        return {"text": "Resumed orchestration."}
+    def _role_denied(action_name: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        message = f"access denied (role={role})"
+        return _ephemeral_payload(message), {
+            "ok": False,
+            "action": action_name,
+            "http_status": 403,
+            "error": message,
+        }
 
-    if action == "mode":
-        target = parts[1].lower() if len(parts) > 1 else None
-        current = read_state()
-        desired = target or ("real" if current.get("mode") == "mock" else "mock")
-        write_state(mode=desired, mode_mock=(desired == "mock"))
-        get_slack_out().post_message(channel_for("control"), f"Mode set to {desired}.")
-        log_event("slack", "control.mode", "mode updated", user=user_id, mode=desired)
-        METRICS.increment_counter("control.actions_total")
-        return {"text": f"Switched mode to {desired}."}
+    if command == "status":
+        success, snapshot, reason, status_code = _status_api_call(user_id, role)
+        if not success or not isinstance(snapshot, dict):
+            message = _dashboard_error_message(reason, status_code)
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "status",
+                "http_status": status_code,
+                "error": message,
+            }
+        text_body, blocks = _format_status_blocks(snapshot)
+        return _ephemeral_payload(text_body, blocks=blocks), {
+            "ok": True,
+            "action": "status",
+            "http_status": status_code,
+        }
 
-    if action == "restart":
-        ok, reason = _ensure_role("restart", user_id)
-        if not ok:
-            return {"text": reason}
-        if len(parts) < 2:
-            return {"text": "Usage: /cx restart [tui|dashboard|worker|slack]"}
-        target = parts[1].lower()
-        try:
-            targets = _parse_targets(target)
-        except Exception as exc:
-            return {"text": str(exc)}
-        report: list[str] = []
-        for name in targets:
-            stopped = _stop_service(name)
-            started = _start_service(name)
-            report.append(f"{name}: stop={stopped} start={started}")
-        message = "Restart summary: " + ", ".join(report)
-        get_slack_out().post_message(channel_for("control"), message)
-        log_event(
-            "slack",
-            "control.restart",
-            "service restart requested",
-            user=user_id,
-            summary=message,
+    if command in {"pause", "resume", "mode", "restart", "order"}:
+        if not allow(command if command != "order" else "order", role):
+            return _role_denied(command)
+
+    if command == "pause":
+        success, snapshot, reason, status_code = _control_api_call(
+            "pause", user_id=user_id, role=role
         )
-        METRICS.increment_counter("control.actions_total")
-        return {"text": message}
+        if not success or not isinstance(snapshot, dict):
+            message = _dashboard_error_message(reason, status_code)
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "pause",
+                "http_status": status_code,
+                "error": message,
+            }
+        announcement = _control_update_message("pause", user_id, snapshot)
+        get_slack_out().post_message(channel_for("control"), announcement)
+        text_body, blocks = _format_status_blocks(snapshot)
+        return _ephemeral_payload(text_body, blocks=blocks), {
+            "ok": True,
+            "action": "pause",
+            "http_status": status_code,
+        }
 
-    if action == "order":
-        ok, reason = _ensure_role("order", user_id)
-        if not ok:
-            return {"text": reason}
-        if len(parts) < 4:
-            return {"text": "Usage: /cx order SYMBOL QTY PX"}
-        symbol = parts[1]
+    if command == "resume":
+        success, snapshot, reason, status_code = _control_api_call(
+            "resume", user_id=user_id, role=role
+        )
+        if not success or not isinstance(snapshot, dict):
+            message = _dashboard_error_message(reason, status_code)
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "resume",
+                "http_status": status_code,
+                "error": message,
+            }
+        announcement = _control_update_message("resume", user_id, snapshot)
+        get_slack_out().post_message(channel_for("control"), announcement)
+        text_body, blocks = _format_status_blocks(snapshot)
+        return _ephemeral_payload(text_body, blocks=blocks), {
+            "ok": True,
+            "action": "resume",
+            "http_status": status_code,
+        }
+
+    if command == "mode":
+        target = tokens[1].lower() if len(tokens) > 1 else None
+        if target and target not in {"mock", "real"}:
+            message = "usage: /cx mode [mock|real]"
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "mode",
+                "http_status": 400,
+                "error": message,
+            }
+        payload: dict[str, Any] = {}
+        if target:
+            payload["value"] = target
+        success, snapshot, reason, status_code = _control_api_call(
+            "mode", user_id=user_id, role=role, extra=payload
+        )
+        if not success or not isinstance(snapshot, dict):
+            message = _dashboard_error_message(reason, status_code)
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "mode",
+                "http_status": status_code,
+                "error": message,
+            }
+        announcement = _control_update_message("mode", user_id, snapshot)
+        get_slack_out().post_message(channel_for("control"), announcement)
+        text_body, blocks = _format_status_blocks(snapshot)
+        return _ephemeral_payload(text_body, blocks=blocks), {
+            "ok": True,
+            "action": "mode",
+            "http_status": status_code,
+        }
+
+    if command == "restart":
+        if len(tokens) < 2:
+            message = "usage: /cx restart <service>"
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "restart",
+                "http_status": 400,
+                "error": message,
+            }
+        targets = tokens[1:]
+        payload: dict[str, Any] = {"service": targets if len(targets) > 1 else targets[0]}
+        success, snapshot, reason, status_code = _control_api_call(
+            "restart", user_id=user_id, role=role, extra=payload
+        )
+        if not success or not isinstance(snapshot, dict):
+            message = _dashboard_error_message(reason, status_code)
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "restart",
+                "http_status": status_code,
+                "error": message,
+            }
+        announcement = _control_update_message("restart", user_id, snapshot)
+        get_slack_out().post_message(channel_for("control"), announcement)
+        text_body, blocks = _format_status_blocks(snapshot)
+        return _ephemeral_payload(text_body, blocks=blocks), {
+            "ok": True,
+            "action": "restart",
+            "http_status": status_code,
+        }
+
+    if command == "order":
+        if len(tokens) < 4:
+            message = "usage: /cx order SYMBOL QTY PX"
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "order",
+                "http_status": 400,
+                "error": message,
+            }
+        symbol = tokens[1]
         try:
-            qty = int(parts[2])
-            px = float(parts[3])
+            qty = int(tokens[2])
+            px = float(tokens[3])
         except ValueError:
-            return {"text": "Quantity must be int, price float."}
-        settings = get_settings()
-        bus = Bus(settings.ipc_db)
-        order_id = bus.enqueue(
-            "order.submit",
-            {"symbol": symbol, "qty": qty, "px": px, "source": "slack", "user": user_id},
+            message = "quantity must be int, price float"
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "order",
+                "http_status": 400,
+                "error": message,
+            }
+        payload = {"symbol": symbol, "qty": qty, "px": px}
+        success, snapshot, reason, status_code = _control_api_call(
+            "order", user_id=user_id, role=role, extra=payload
         )
-        orders.add_order(
-            {"source": "slack", "symbol": symbol, "qty": qty, "px": px, "user": user_id}
-        )
-        token = request_approval(
-            order_id,
-            initiator=user_id,
-            ttl_s=settings.order_approval_ttl_sec,
-        )
-        message = (
-            f"Order request #{order_id} {symbol} qty={qty} px={px} "
-            f"initiated by <@{user_id}>. Token: {token}"
-        )
-        get_slack_out().post_message(
-            channel_for("orders"),
-            message,
-            metadata={"order_id": order_id, "token": token, "type": "order.submit"},
-        )
-        log_event(
-            "slack",
-            "order.new",
-            "order submitted via slack",
-            user=user_id,
-            symbol=symbol,
-            qty=qty,
-            px=px,
-            order_id=order_id,
-        )
-        METRICS.increment_counter("control.actions_total")
-        return {"text": f"Order #{order_id} queued. Awaiting confirmation token {token}."}
+        if not success or not isinstance(snapshot, dict):
+            message = _dashboard_error_message(reason, status_code)
+            return _ephemeral_payload(message), {
+                "ok": False,
+                "action": "order",
+                "http_status": status_code,
+                "error": message,
+            }
+        last_action = snapshot.get("last_action")
+        order_info: Mapping[str, Any] | None = None
+        if isinstance(last_action, Mapping):
+            details = last_action.get("details")
+            if isinstance(details, Mapping):
+                candidate = details.get("order")
+                if isinstance(candidate, Mapping):
+                    order_info = candidate
+        if order_info:
+            text_out, metadata = _order_announcement(user_id, order_info)
+            get_slack_out().post_message(channel_for("orders"), text_out, metadata=metadata)
+        announcement = _control_update_message("order", user_id, snapshot)
+        get_slack_out().post_message(channel_for("control"), announcement)
+        text_body, blocks = _format_status_blocks(snapshot)
+        return _ephemeral_payload(text_body, blocks=blocks), {
+            "ok": True,
+            "action": "order",
+            "http_status": status_code,
+        }
 
-    return {"text": f"Unknown subcommand '{action}'."}
+    return _ephemeral_payload(_help_text()), {
+        "ok": False,
+        "action": command,
+        "http_status": 400,
+        "error": "unknown command",
+    }
 
 
 def handle_button(
@@ -809,26 +1224,86 @@ def route_alert(level: str, topic: str, message: str, **fields: Any) -> None:
 
 def process_slash_command_request(
     body: Mapping[str, Any] | None,
-    ack: Callable[[], Any],
-    respond: Callable[[str], Any],
+    ack: Callable[[dict[str, Any]], Any],
+    respond: Callable[[dict[str, Any]], Any],
     *,
-    handler: Callable[..., dict[str, Any]] = handle_slash_command,
+    handler: Callable[..., tuple[dict[str, Any], dict[str, Any]]] = handle_slash_command,
 ) -> None:
-    """Wrap slash command handling ensuring immediate acknowledgement."""
+    """Wrap slash command handling ensuring immediate acknowledgement and logging."""
 
-    ack()
     payload = dict(body) if isinstance(body, Mapping) else {}
     user_id = str(payload.get("user_id") or "")
+    channel_id = str(payload.get("channel_id") or payload.get("channel", ""))
     text_raw = payload.get("text")
     text = str(text_raw) if text_raw is not None else ""
+    tokens = [segment for segment in text.strip().split() if segment]
+    action_hint = tokens[0].lower() if tokens else "help"
+
+    start = time.monotonic()
+    log_event(
+        "slack",
+        "command.start",
+        "slash command received",
+        user=user_id,
+        channel=channel_id,
+        text=text,
+        action=action_hint,
+    )
+
+    ack(_ephemeral_payload("processing..."))
+
     try:
-        response = handler(user_id=user_id, text=text)
-        message = str(response.get("text") or "ok")
+        response_payload, meta = handler(user_id=user_id, channel=channel_id, text=text)
     except Exception as exc:  # pragma: no cover - defensive
-        log_event("slack", "handler", "cx error", level="ERROR", error=str(exc))
-        respond("error processing command")
+        duration_ms = int((time.monotonic() - start) * 1000)
+        log_event(
+            "slack",
+            "command.error",
+            "slash command failed",
+            level="ERROR",
+            user=user_id,
+            channel=channel_id,
+            text=text,
+            action=action_hint,
+            duration_ms=duration_ms,
+            error=str(exc),
+            stack=traceback.format_exc(),
+        )
+        short_reason = str(exc).splitlines()[0] if str(exc) else "unexpected error"
+        respond(_ephemeral_payload(f"command failed: {short_reason}"))
         return
-    respond(message)
+
+    respond(response_payload)
+
+    duration_ms = int((time.monotonic() - start) * 1000)
+    action_name = meta.get("action") or action_hint
+    http_status = meta.get("http_status")
+    if meta.get("ok", True):
+        log_event(
+            "slack",
+            "command.ok",
+            "slash command processed",
+            user=user_id,
+            channel=channel_id,
+            text=text,
+            action=action_name,
+            duration_ms=duration_ms,
+            http_status=http_status,
+        )
+    else:
+        log_event(
+            "slack",
+            "command.error",
+            "slash command completed with error",
+            level="ERROR",
+            user=user_id,
+            channel=channel_id,
+            text=text,
+            action=action_name,
+            duration_ms=duration_ms,
+            http_status=http_status,
+            error=meta.get("error"),
+        )
 
 
 def process_action_request(
@@ -881,13 +1356,43 @@ class SlackService:
     def __init__(self) -> None:
         self.settings = get_settings()
         self.out = get_slack_out()
+        self.bus = Bus(self.settings.ipc_db)
+        self._stop_event = Event()
+        self._last_notify_id = 0
+        existing = self.bus.tail_events(limit=1, topic="slack.notify")
+        if existing:
+            self._last_notify_id = existing[-1]["id"]
+
+    def _background_tick(self) -> None:
+        self._last_notify_id = dispatch_notifications(self.out, self.bus, self._last_notify_id)
+
+    def _background_loop(self) -> None:
+        run_selftest_cycle(self.out, self.bus)
+        next_selftest = time.monotonic() + 60.0
+        next_heartbeat = time.monotonic()
+        while not self._stop_event.is_set():
+            self._background_tick()
+            now = time.monotonic()
+            if now >= next_selftest:
+                run_selftest_cycle(self.out, self.bus)
+                next_selftest = now + 60.0
+            if now >= next_heartbeat:
+                self.bus.record_heartbeat("slack", epoch_ms())
+                log_event(
+                    "slack",
+                    "heartbeat",
+                    "slack service alive",
+                    mode="sim" if self.out.simulation else "real",
+                )
+                next_heartbeat = now + 15.0
+            time.sleep(2.0)
 
     def _run_simulation(self) -> None:
         log_event("slack", "startup", "slack service started (simulation)", mode="sim")
-        interval = 15
-        while True:
-            log_event("slack", "heartbeat", "slack simulation alive")
-            time.sleep(interval)
+        try:
+            self._background_loop()
+        finally:
+            self._stop_event.set()
 
     def _run_socket_mode(self) -> None:  # pragma: no cover - requires slack_bolt/slack_sdk
         # Hard dependency only when enabled.
@@ -935,7 +1440,13 @@ class SlackService:
             process_action_request("reject", body, ack, respond)
 
         log_event("slack", "startup", "slack socket-mode starting")
-        SocketModeHandler(app, app_token).start()
+        background = Thread(target=self._background_loop, daemon=True)
+        background.start()
+        try:
+            SocketModeHandler(app, app_token).start()
+        finally:
+            self._stop_event.set()
+            background.join(timeout=2.0)
 
     def run(self) -> None:
         ensure_runtime_dirs()

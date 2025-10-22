@@ -34,6 +34,7 @@ class AppSettings(BaseSettings):
     dashboard_enabled: bool = True
     dashboard_host: str = "127.0.0.1"
     dashboard_port: int = 8787
+    dashboard_auth_required: bool = False
     dashboard_auth_token: str | None = None
 
     ibkr_enabled: bool = False

@@ -22,6 +22,11 @@ class KPIStore:
         self._open_approvals = 0
         self._queue_depth = 0
         self._counters: dict[str, int] = {}
+        self._risk: dict[str, float] = {
+            "pnl_day": 0.0,
+            "pnl_open": 0.0,
+            "margin_used_pct": 0.0,
+        }
 
     def _prune(self, container: deque[float], now: float, window: float) -> None:
         while container and now - container[0] > window:
@@ -53,6 +58,23 @@ class KPIStore:
         with self._lock:
             self._queue_depth = max(0, value)
 
+    def update_risk(
+        self,
+        *,
+        pnl_day: float | None = None,
+        pnl_open: float | None = None,
+        margin_used_pct: float | None = None,
+    ) -> None:
+        """Update risk snapshot fields used for dashboard simulations."""
+
+        with self._lock:
+            if pnl_day is not None:
+                self._risk["pnl_day"] = float(pnl_day)
+            if pnl_open is not None:
+                self._risk["pnl_open"] = float(pnl_open)
+            if margin_used_pct is not None:
+                self._risk["margin_used_pct"] = float(margin_used_pct)
+
     def snapshot(self) -> dict[str, Any]:
         now_ts = time.time()
         with self._lock:
@@ -65,6 +87,7 @@ class KPIStore:
                 "errors_1m": len(self._errors),
                 "alerts_dedup_1m": len(self._alert_dedup),
                 "alerts_throttle_1m": len(self._alert_throttle),
+                "risk": dict(self._risk),
             }
             if self._counters:
                 snapshot["counters"] = dict(self._counters)
@@ -80,6 +103,11 @@ class KPIStore:
             self._open_approvals = 0
             self._queue_depth = 0
             self._counters.clear()
+            self._risk = {
+                "pnl_day": 0.0,
+                "pnl_open": 0.0,
+                "margin_used_pct": 0.0,
+            }
 
     def increment_counter(self, key: str, amount: int = 1) -> None:
         """Increment a named counter used for diagnostics."""

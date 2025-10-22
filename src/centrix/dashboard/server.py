@@ -8,6 +8,8 @@ import os
 import platform
 import secrets
 import sys
+from base64 import b64decode
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -21,14 +23,17 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import HTMLResponse, JSONResponse
+from starlette.requests import ClientDisconnect
 
 from centrix import __version__
-from centrix.cli import _start_service, _stop_service
+from centrix.cli import _parse_targets, _start_service, _stop_service
 from centrix.core.alerts import alert_counters
+from centrix.core.approvals import request_approval
 from centrix.core.logging import log_event, warn_on_local_env
 from centrix.core.metrics import METRICS, snapshot_kpis
+from centrix.core.rbac import allow
 from centrix.core.orders import add_order, list_orders
-from centrix.ipc import read_state, write_state
+from centrix.ipc import epoch_ms, read_state, write_state
 from centrix.ipc.bus import Bus
 from centrix.settings import AppSettings, get_settings
 
@@ -43,9 +48,40 @@ BUILD_INFO = {
 CLIENTS: dict[str, dict[str, Any]] = {}
 WS_PUSH_INTERVAL = 2.0
 EVENT_LIMIT = 25
+LAST_ACTION: dict[str, Any] | None = None
+AUTH_ALLOWED_ROLES = {"observer", "operator", "admin"}
+_HEARTBEAT_INTERVAL = 5.0
+_HEARTBEAT_TASK: asyncio.Task | None = None
+
+
+@dataclass(slots=True)
+class ControlIdentity:
+    """Represents the caller interacting with control endpoints."""
+
+    principal: str
+    user: str | None
+    role: str
+
+
+class DashboardUnauthorized(Exception):
+    """Raised when dashboard authentication fails."""
+
+    def __init__(self, reason: str, user: str | None, has_token: bool) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.user = user
+        self.has_token = has_token
 
 app = FastAPI(title=settings.app_brand, version=__version__)
 warn_on_local_env("dashboard")
+
+@app.exception_handler(DashboardUnauthorized)
+async def handle_dashboard_unauthorized(_: Request, exc: DashboardUnauthorized) -> JSONResponse:
+    return JSONResponse(
+        status_code=401,
+        content={"ok": False, "error": "unauthorized", "reason": exc.reason},
+    )
+
 
 INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -120,6 +156,64 @@ INDEX_HTML = """<!DOCTYPE html>
         margin: 0 0 0.75rem;
         letter-spacing: 0.02em;
       }
+      .status-grid,
+      .kpi-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+        gap: 0.75rem;
+        margin-bottom: 0.75rem;
+      }
+      .status-grid div,
+      .kpi-grid div {
+        background: rgba(59, 130, 246, 0.08);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 0.6rem;
+      }
+      .status-grid span,
+      .kpi-grid span {
+        display: block;
+        color: var(--muted);
+        font-size: 0.75rem;
+        letter-spacing: 0.05em;
+      }
+      .status-grid strong,
+      .kpi-grid strong {
+        display: block;
+        margin-top: 0.25rem;
+        font-size: 1.1rem;
+      }
+      .connectivity-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem;
+        margin-bottom: 0.5rem;
+      }
+      .chip {
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        border: 1px solid var(--border);
+        background: rgba(15, 118, 110, 0.08);
+        font-size: 0.85rem;
+      }
+      .chip.up {
+        color: #15803d;
+      }
+      .chip.down {
+        color: #dc2626;
+      }
+      .chip.unknown {
+        color: var(--muted);
+      }
+      #last-action {
+        color: var(--muted);
+        font-size: 0.85rem;
+      }
+      .clients-list div {
+        padding: 0.35rem 0;
+        border-bottom: 1px solid var(--border);
+        font-size: 0.9rem;
+      }
       button {
         background: var(--primary);
         color: #ffffff;
@@ -189,7 +283,9 @@ INDEX_HTML = """<!DOCTYPE html>
     <main>
       <section id="state-panel" class="card">
         <h3>SYSTEMSTATUS</h3>
-        <div id="state"></div>
+        <div id="state" class="status-grid"></div>
+        <div id="kpi" class="kpi-grid"></div>
+        <div id="last-action"></div>
       </section>
       <section id="clients-panel" class="card">
         <h3>VERBINDUNGEN</h3>
@@ -208,9 +304,36 @@ INDEX_HTML = """<!DOCTYPE html>
       const indicator = document.getElementById('status-indicator');
       const tokenInput = document.getElementById('token-input');
       const darkModeBtn = document.getElementById('btn-dark-mode');
+      const STORAGE_KEY = 'centrix.dashboard.token';
       let currentToken = '';
       let ws = null;
       let pollInterval = null;
+
+      function readStoredToken() {
+        try {
+          return window.localStorage.getItem(STORAGE_KEY) || '';
+        } catch (err) {
+          console.warn('Local storage unavailable', err);
+          return '';
+        }
+      }
+
+      function persistToken(value) {
+        try {
+          if (value) {
+            window.localStorage.setItem(STORAGE_KEY, value);
+          } else {
+            window.localStorage.removeItem(STORAGE_KEY);
+          }
+        } catch (err) {
+          console.warn('Failed to persist token', err);
+        }
+      }
+
+      currentToken = readStoredToken();
+      if (currentToken) {
+        tokenInput.value = currentToken;
+      }
 
       function headers() {
         const h = { 'Content-Type': 'application/json' };
@@ -220,62 +343,128 @@ INDEX_HTML = """<!DOCTYPE html>
         return h;
       }
 
-      function renderState(data) {
-        const stateDiv = document.getElementById('state');
-        const lines = [];
-        if (data.state) {
-          lines.push(`Mode: ${data.state.mode} (mock=${data.state.mode_mock})`);
-          lines.push(`Paused: ${data.state.paused}`);
-        }
-        if (data.kpi) {
-          lines.push(`Errors 1m: ${data.kpi.errors_1m ?? 0}`);
-          const actions = data.kpi.counters?.['control.actions_total'] ?? 0;
-          lines.push(`Control actions: ${actions}`);
-        }
-        if (data.services) {
-          Object.entries(data.services).forEach(([name, info]) => {
-            lines.push(`${name}: ${info.running ? 'running' : 'stopped'} pid=${info.pid ?? '-'}`);
-          });
-        }
-        stateDiv.textContent = lines.join('\\n');
+      function formatNumber(value, digits = 2) {
+        const num = Number(value);
+        return Number.isFinite(num) ? num.toFixed(digits) : (0).toFixed(digits);
       }
 
-      function renderClients(list) {
-        const container = document.getElementById('clients');
-        if (!list || list.length === 0) {
-          container.textContent = 'No active clients';
-          return;
+      function formatPercent(value, digits = 1) {
+        const num = Number(value);
+        return Number.isFinite(num) ? num.toFixed(digits) : (0).toFixed(digits);
+      }
+
+      function formatUser(user) {
+        if (!user) {
+          return 'system';
         }
-        const rows = list.map(c => `<div>${c.id} @ ${c.remote} (since ${c.connected_at})</div>`);
-        container.innerHTML = rows.join('');
+        return user.startsWith('U') ? `@${user}` : user;
+      }
+
+      function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, char =>
+          ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]
+        );
+      }
+
+      function renderState(data) {
+        const systemDiv = document.getElementById('state');
+        const kpiDiv = document.getElementById('kpi');
+        const lastDiv = document.getElementById('last-action');
+
+        const connectivity = data.connectivity || {};
+        const slackRaw = String(connectivity.slack ?? 'unknown').toLowerCase();
+        const slackStatus = ['up', 'down', 'unknown'].includes(slackRaw) ? slackRaw : 'unknown';
+        const statusItems = [
+          ['Mode', data.mode ?? '-'],
+          ['Paused', data.paused ? 'Ja' : 'Nein'],
+          ['Heartbeat', data.heartbeat ?? '-'],
+          ['Slack', slackStatus.toUpperCase()],
+        ];
+        systemDiv.innerHTML = statusItems
+          .map(([label, value]) => `<div><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`)
+          .join('');
+
+        const risk = data.risk || {};
+        const pnlDay = formatNumber(risk.pnl_day ?? 0);
+        const pnlOpen = formatNumber(risk.pnl_open ?? 0);
+        const marginUsed = formatPercent(risk.margin_used_pct ?? 0);
+        kpiDiv.innerHTML = [
+          ['PnL Day', pnlDay],
+          ['PnL Open', pnlOpen],
+          ['Margin Used', `${marginUsed}%`],
+        ]
+          .map(([label, value]) => `<div><span>${label}</span><strong>${value}</strong></div>`)
+          .join('');
+
+        const last = data.last_action;
+        if (last && last.action) {
+          const actor = formatUser(last.user);
+          const role = last.role ? ` (${last.role})` : '';
+          lastDiv.textContent = `Letzte Aktion: ${last.action} durch ${actor}${role} um ${last.ts}`;
+        } else {
+          lastDiv.textContent = '';
+        }
+      }
+
+      function renderClients(data) {
+        const container = document.getElementById('clients');
+        const connectivity = data.connectivity || {};
+        const chips = Object.entries(connectivity)
+          .map(([name, status]) => {
+            const statusValue = String(status ?? 'unknown').toLowerCase();
+            const safeStatus = ['up', 'down', 'unknown'].includes(statusValue) ? statusValue : 'unknown';
+            return `<span class="chip ${safeStatus}">${escapeHtml(name)}: ${escapeHtml(safeStatus)}</span>`;
+          })
+          .join('');
+        const clients = Array.isArray(data.clients) ? data.clients : [];
+        const clientRows = clients
+          .map(c => {
+            const since = c.connected_at ? ` · seit ${escapeHtml(c.connected_at)}` : '';
+            return `<div>${escapeHtml(c.id)} @ ${escapeHtml(c.remote || '?')}${since}</div>`;
+          })
+          .join('');
+        const chipsHtml = chips || '<span class="chip unknown">Keine Daten</span>';
+        const clientsHtml = clientRows || '<div>Keine aktiven Clients</div>';
+        container.innerHTML = `
+          <div class="connectivity-chips">${chipsHtml}</div>
+          <div class="clients-list">${clientsHtml}</div>
+        `;
       }
 
       function renderOrders(list) {
         const container = document.getElementById('orders');
-        if (!list || list.length === 0) {
-          container.textContent = 'No orders';
+        if (!Array.isArray(list) || list.length === 0) {
+          container.textContent = 'Keine offenen Orders';
           return;
         }
         const rows = list
           .slice(0, 10)
-          .map(o => `<div>${o.ts} ${o.symbol} qty=${o.qty} px=${o.px} src=${o.source}</div>`);
-        container.innerHTML = rows.join('');
+          .map(o => {
+            const ts = o.ts ? `${escapeHtml(o.ts)} ` : '';
+            return `<div>${ts}${escapeHtml(o.symbol)} qty=${escapeHtml(o.qty)} px=${escapeHtml(o.px)} src=${escapeHtml(o.source)}</div>`;
+          })
+          .join('');
+        container.innerHTML = rows;
       }
 
       let eventBuffer = [];
       function renderEvents(evts) {
         const container = document.getElementById('events');
-        eventBuffer = evts.concat(eventBuffer).slice(0, 25);
-        container.innerHTML = eventBuffer.map(evt => {
-          const payload = JSON.stringify(evt.data ?? {}, null, 0);
-          return `<div>${evt.id} ${evt.topic} [${evt.level}] ${payload}</div>`;
-        }).join('');
+        const newEvents = Array.isArray(evts) ? evts : [];
+        eventBuffer = newEvents.concat(eventBuffer).slice(0, 25);
+        container.innerHTML = eventBuffer
+          .map(evt => {
+            const payload = escapeHtml(JSON.stringify(evt.data ?? {}, null, 0));
+            return `<div>${escapeHtml(evt.id)} ${escapeHtml(evt.topic)} [${escapeHtml(evt.level)}] ${payload}</div>`;
+          })
+          .join('');
       }
 
       function applyStatus(data) {
         renderState(data);
-        renderClients(data.clients || []);
-        renderOrders(data.orders || []);
+        renderClients(data);
+        const orders = data.orders_open || data.orders || [];
+        renderOrders(orders);
         if (data.events) {
           renderEvents(data.events);
         }
@@ -285,8 +474,17 @@ INDEX_HTML = """<!DOCTYPE html>
         fetch('/api/status', { headers: headers() })
           .then(r => {
             if (r.status === 401) {
-              indicator.textContent = 'Unauthorized';
-              return r.json().then(j => { throw new Error(j.detail || 'Unauthorized'); });
+              return r
+                .json()
+                .then(j => {
+                  const reason = (j && j.reason) || 'unauthorized';
+                  indicator.textContent = reason === 'role_denied' ? 'Role denied' : 'Unauthorized';
+                  throw new Error(reason);
+                })
+                .catch(() => {
+                  indicator.textContent = 'Unauthorized';
+                  throw new Error('unauthorized');
+                });
             }
             return r.json();
           })
@@ -344,7 +542,17 @@ INDEX_HTML = """<!DOCTYPE html>
         })
           .then(r => {
             if (r.status === 401) {
-              indicator.textContent = 'Unauthorized';
+              return r
+                .json()
+                .then(j => {
+                  const reason = (j && j.reason) || 'unauthorized';
+                  indicator.textContent = reason === 'role_denied' ? 'Role denied' : 'Unauthorized';
+                  throw new Error(reason);
+                })
+                .catch(() => {
+                  indicator.textContent = 'Unauthorized';
+                  throw new Error('unauthorized');
+                });
             }
             return r.json();
           })
@@ -363,8 +571,14 @@ INDEX_HTML = """<!DOCTYPE html>
       });
       tokenInput.addEventListener('change', () => {
         currentToken = tokenInput.value.trim();
+        persistToken(currentToken);
         openSocket();
         fetchStatus();
+      });
+
+      tokenInput.addEventListener('input', () => {
+        currentToken = tokenInput.value.trim();
+        persistToken(currentToken);
       });
 
       openSocket();
@@ -382,13 +596,52 @@ INDEX_HTML = """<!DOCTYPE html>
 """
 
 
-def _require_token(request: Request) -> None:
-    token = os.environ.get("DASHBOARD_AUTH_TOKEN") or get_settings().dashboard_auth_token
-    if not token:
-        return
-    supplied = request.headers.get("X-Dashboard-Token")
-    if supplied != token:
-        raise HTTPException(status_code=401, detail="unauthorized")
+@app.on_event("startup")
+async def _on_startup() -> None:
+    global _HEARTBEAT_TASK
+    _record_dashboard_heartbeat()
+    if _HEARTBEAT_TASK and not _HEARTBEAT_TASK.done():
+        _HEARTBEAT_TASK.cancel()
+        try:
+            await _HEARTBEAT_TASK
+        except asyncio.CancelledError:
+            pass
+    _HEARTBEAT_TASK = asyncio.create_task(_heartbeat_loop())
+
+
+@app.on_event("shutdown")
+async def _on_shutdown() -> None:
+    global _HEARTBEAT_TASK
+    if _HEARTBEAT_TASK:
+        _HEARTBEAT_TASK.cancel()
+        try:
+            await _HEARTBEAT_TASK
+        except asyncio.CancelledError:
+            pass
+        _HEARTBEAT_TASK = None
+
+
+def _parse_basic_auth(header: str) -> tuple[str, str]:
+    if not header.lower().startswith("basic "):
+        raise ValueError("unsupported auth scheme")
+    encoded = header.split(" ", 1)[1].strip()
+    try:
+        decoded = b64decode(encoded).decode("utf-8")
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("invalid basic auth header") from exc
+    if ":" not in decoded:
+        raise ValueError("invalid basic auth payload")
+    user, password = decoded.split(":", 1)
+    return user, password
+
+
+def _require_token(request: Request) -> ControlIdentity:
+    return _resolve_identity(
+        header_token=request.headers.get("X-Dashboard-Token"),
+        query_token=None,
+        auth_header=request.headers.get("Authorization"),
+        transport="http",
+    )
 
 
 def _load_slack_selftest_detail() -> str | None:
@@ -429,9 +682,14 @@ def _load_slack_selftest_detail() -> str | None:
     )
 
 
-def status_payload() -> dict[str, Any]:
+def status_payload(last_action: dict[str, Any] | None = None) -> dict[str, Any]:
+    global LAST_ACTION
+    if last_action is not None:
+        LAST_ACTION = last_action
+    snapshot_last_action = LAST_ACTION
+
     bus = Bus(settings.ipc_db)
-    state = read_state()
+    state = read_state() or {}
     services = bus.get_services_status(SERVICE_NAMES)
     slack_detail = _load_slack_selftest_detail()
     if slack_detail is not None:
@@ -443,19 +701,61 @@ def status_payload() -> dict[str, Any]:
     orders = list_orders()
     events = bus.tail_events(limit=EVENT_LIMIT)
     clients = list(CLIENTS.values())
+    heartbeat = datetime.now(UTC).isoformat(timespec="seconds") + "Z"
+
+    now_ms = epoch_ms()
+    connectivity: dict[str, str] = {}
+    for name in SERVICE_NAMES:
+        info = services.get(name)
+        status = "unknown"
+        if isinstance(info, dict):
+            heartbeat_ms: int | None = None
+            heartbeat_raw = info.get("last_heartbeat")
+            if heartbeat_raw is not None:
+                try:
+                    heartbeat_ms = int(heartbeat_raw)
+                except (TypeError, ValueError):
+                    heartbeat_ms = None
+            if info.get("running") is True:
+                status = "up"
+            elif info.get("running") is False:
+                status = "down"
+            if heartbeat_ms is not None and now_ms - heartbeat_ms <= 10_000:
+                status = "up"
+        connectivity[name] = status
+
+    risk_snapshot = kpi.get("risk") if isinstance(kpi, dict) else None
+    risk_payload = {
+        "pnl_day": float(risk_snapshot.get("pnl_day", 0.0)) if risk_snapshot else 0.0,
+        "pnl_open": float(risk_snapshot.get("pnl_open", 0.0)) if risk_snapshot else 0.0,
+        "margin_used_pct": float(risk_snapshot.get("margin_used_pct", 0.0))
+        if risk_snapshot
+        else 0.0,
+    }
+
     return {
-        "state": state,
-        "services": services,
-        "kpi": kpi,
+        "ok": True,
+        "mode": state.get("mode") or ("mock" if state.get("mode_mock") else "real"),
+        "paused": bool(state.get("paused", False)),
+        "heartbeat": heartbeat,
+        "connectivity": connectivity,
+        "risk": risk_payload,
+        "orders_open": orders,
         "orders": orders,
         "events": events,
         "clients": clients,
         "build": BUILD_INFO,
         "alerts": alert_counters(),
+        "services": services,
+        "kpi": kpi,
+        "state": state,
+        "last_action": snapshot_last_action,
     }
 
 
-def _record_action(action: str, status: str = "ok", **fields: Any) -> None:
+def _record_action(
+    action: str, identity: ControlIdentity, status: str = "ok", **fields: Any
+) -> None:
     METRICS.increment_counter("control.actions_total")
     log_event(
         "dashboard",
@@ -463,8 +763,22 @@ def _record_action(action: str, status: str = "ok", **fields: Any) -> None:
         "dashboard action executed",
         action=action,
         status=status,
-        user="dashboard",
+        user=identity.user or identity.principal,
+        role=identity.role,
         **fields,
+    )
+    Bus(settings.ipc_db).emit(
+        "slack.notify",
+        "INFO",
+        {
+            "type": "control-action",
+            "action": action,
+            "status": status,
+            "ts": datetime.now(UTC).isoformat(timespec="seconds") + "Z",
+            "user": identity.user or identity.principal,
+            "role": identity.role,
+            "fields": fields,
+        },
     )
 
 
@@ -473,7 +787,7 @@ async def index() -> HTMLResponse:
     return HTMLResponse(content=INDEX_HTML)
 
 
-@app.get("/healthz")
+@app.get("/healthz", response_class=JSONResponse)
 async def healthz() -> dict[str, Any]:
     services: dict[str, dict[str, Any]]
     try:
@@ -481,6 +795,9 @@ async def healthz() -> dict[str, Any]:
         services = bus.get_services_status(SERVICE_NAMES)
     except Exception as exc:  # pragma: no cover - defensive
         services = {"error": {"message": str(exc)}}
+    else:
+        for required_name in ("dashboard", "worker", "slack"):
+            services.setdefault(required_name, {})
     return {
         "ok": True,
         "services": services,
@@ -506,10 +823,9 @@ async def metrics() -> dict[str, Any]:
 
 
 @app.get("/api/status")
-async def api_status(_: None = Depends(_require_token)) -> JSONResponse:
+async def api_status(_identity: ControlIdentity = Depends(_require_token)) -> JSONResponse:
     try:
         payload = status_payload()
-        payload["ok"] = True
         return JSONResponse(payload)
     except Exception as exc:  # pragma: no cover - defensive
         log_event("dashboard", "api.status", "status error", level="ERROR", error=str(exc))
@@ -561,17 +877,41 @@ def _restart_service(name: str) -> dict[str, Any]:
 
 
 @app.post("/api/control")
-async def api_control(request: Request, _: None = Depends(_require_token)) -> JSONResponse:
-    payload = await request.json()
-    return JSONResponse(_handle_control_action(payload))
-
-
-def _handle_control_action(payload: dict[str, Any]) -> dict[str, Any]:
+async def control_endpoint(
+    request: Request, identity: ControlIdentity = Depends(_require_token)
+) -> JSONResponse:
+    try:
+        payload = await request.json()
+    except ClientDisconnect:
+        log_event("dashboard", "api.control", "client disconnected", level="WARN")
+        return JSONResponse({"ok": False, "error": "client_disconnected"}, status_code=499)
     action = payload.get("action")
-    if not action:
+    if not isinstance(action, str) or not action:
         raise HTTPException(status_code=400, detail="action required")
+    snapshot = api_control(action, identity=identity, body=payload)
+    return JSONResponse(snapshot)
 
-    state = read_state()
+
+def _authorised_name(action: str) -> str | None:
+    mapping = {
+        "pause": "pause",
+        "resume": "resume",
+        "mode": "mode",
+        "restart": "restart",
+        "test-order": "order",
+        "order": "order",
+    }
+    return mapping.get(action)
+
+
+def _apply_control_action(
+    action: str, payload: dict[str, Any], identity: ControlIdentity
+) -> dict[str, Any]:
+    required = _authorised_name(action)
+    if required and not allow(required, identity.role):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    state = read_state() or {}
     result: dict[str, Any] = {"action": action}
 
     if action == "pause":
@@ -584,39 +924,106 @@ def _handle_control_action(payload: dict[str, Any]) -> dict[str, Any]:
         state = _toggle_mode(state, payload.get("value"))
         result["state"] = state
     elif action == "restart":
-        service = payload.get("service")
-        if not service:
+        service_spec = payload.get("service")
+        if not service_spec:
             raise HTTPException(status_code=400, detail="service required")
-        result["restart"] = _restart_service(service)
+        targets: list[str]
+        if isinstance(service_spec, list):
+            targets = [str(item) for item in service_spec if item]
+        else:
+            targets = _parse_targets(str(service_spec))
+        reports = [_restart_service(name) for name in targets]
+        result["restart"] = reports if len(reports) > 1 else reports[0]
+    elif action == "order":
+        symbol = payload.get("symbol")
+        if not symbol:
+            raise HTTPException(status_code=400, detail="symbol required")
+        try:
+            qty_val = int(payload.get("qty", 0))
+            px_val = float(payload.get("px", 0.0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="invalid order payload") from exc
+        if qty_val <= 0:
+            raise HTTPException(status_code=400, detail="qty must be positive")
+        if px_val < 0:
+            raise HTTPException(status_code=400, detail="px must be non-negative")
+        bus = Bus(settings.ipc_db)
+        order_message = {
+            "symbol": symbol,
+            "qty": qty_val,
+            "px": px_val,
+            "source": identity.principal,
+            "user": identity.user,
+        }
+        order_id = bus.enqueue("order.submit", order_message)
+        add_order(order_message)
+        token = request_approval(
+            order_id,
+            initiator=identity.user or identity.principal,
+            ttl_s=settings.order_approval_ttl_sec,
+        )
+        result["order"] = {
+            "id": order_id,
+            "symbol": symbol,
+            "qty": qty_val,
+            "px": px_val,
+            "token": token,
+        }
     elif action == "test-order":
         order_payload = {
-            "source": "dashboard",
+            "source": identity.principal,
             "symbol": payload.get("symbol", "DEMO"),
             "qty": payload.get("qty", 1),
             "px": payload.get("px", 0),
+            "user": identity.user,
         }
         result["order"] = add_order(order_payload)
     else:
         raise HTTPException(status_code=400, detail="unknown action")
 
-    _record_action(action, **{k: v for k, v in result.items() if k != "action"})
+    _record_action(action, identity, **{k: v for k, v in result.items() if k != "action"})
     return {"status": "ok", **result}
 
 
-def _ws_authorized(websocket: WebSocket) -> bool:
-    token = os.environ.get("DASHBOARD_AUTH_TOKEN") or get_settings().dashboard_auth_token
-    if not token:
-        return True
-    query_token = websocket.query_params.get("token")
-    header_token = websocket.headers.get("X-Dashboard-Token")
-    return token in {query_token, header_token}
+def api_control(
+    action: str, *, identity: ControlIdentity, body: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    payload = body or {}
+    outcome = _apply_control_action(action, payload, identity)
+    details = {k: v for k, v in outcome.items() if k != "status"}
+    ts = datetime.now(UTC).isoformat(timespec="seconds") + "Z"
+    last_action = {
+        "action": action,
+        "status": outcome.get("status", "ok"),
+        "user": identity.user or identity.principal,
+        "role": identity.role,
+        "ts": ts,
+        "details": details,
+    }
+    return status_payload(last_action=last_action)
 
 
-def _client_snapshot(websocket: WebSocket, client_id: str) -> dict[str, Any]:
+def _ws_authorized(websocket: WebSocket) -> ControlIdentity:
+    return _resolve_identity(
+        header_token=websocket.headers.get("X-Dashboard-Token"),
+        query_token=websocket.query_params.get("token"),
+        auth_header=websocket.headers.get("Authorization"),
+        transport="websocket",
+    )
+
+
+def _client_snapshot(
+    websocket: WebSocket,
+    client_id: str,
+    identity: ControlIdentity | None,
+) -> dict[str, Any]:
     return {
         "id": client_id,
         "remote": getattr(websocket.client, "host", "?"),
         "connected_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "principal": identity.principal if identity else None,
+        "user": identity.user if identity else None,
+        "role": identity.role if identity else None,
     }
 
 
@@ -629,12 +1036,14 @@ def _events_since(last_id: int | None) -> list[dict[str, Any]]:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    if not _ws_authorized(websocket):
+    try:
+        identity = _ws_authorized(websocket)
+    except DashboardUnauthorized:
         await websocket.close(code=1008)
         return
     await websocket.accept()
     client_id = secrets.token_hex(4)
-    CLIENTS[client_id] = _client_snapshot(websocket, client_id)
+    CLIENTS[client_id] = _client_snapshot(websocket, client_id, identity)
     last_event_id: int | None = None
     try:
         while True:
@@ -648,3 +1057,112 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         pass
     finally:
         CLIENTS.pop(client_id, None)
+def _is_auth_required() -> bool:
+    override = os.environ.get("DASHBOARD_AUTH_REQUIRED")
+    if override is not None:
+        normalised = override.strip().lower()
+        if normalised in {"1", "true", "yes", "on"}:
+            return True
+        if normalised in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(settings.dashboard_auth_required)
+
+
+def _configured_dashboard_token() -> str | None:
+    token = os.environ.get("DASHBOARD_AUTH_TOKEN")
+    if token:
+        return token
+    return settings.dashboard_auth_token
+
+
+def _auth_failure(
+    reason: str,
+    *,
+    user: str | None,
+    has_token: bool,
+    transport: str,
+) -> None:
+    log_event(
+        "dashboard",
+        "auth",
+        "reject",
+        reason=reason,
+        user=user,
+        has_token=has_token,
+        transport=transport,
+    )
+    raise DashboardUnauthorized(reason=reason, user=user, has_token=has_token)
+
+
+def _extract_basic_credentials(header: str | None) -> tuple[str, str] | None:
+    if not header:
+        return None
+    try:
+        return _parse_basic_auth(header)
+    except ValueError:
+        return None
+
+
+def _resolve_identity(
+    *,
+    header_token: str | None,
+    query_token: str | None,
+    auth_header: str | None,
+    transport: str,
+) -> ControlIdentity:
+    required = _is_auth_required()
+    configured_token = _configured_dashboard_token()
+    provided_tokens = tuple(token for token in (header_token, query_token) if token)
+    has_token = bool(provided_tokens)
+
+    if configured_token and any(token == configured_token for token in provided_tokens):
+        return ControlIdentity(principal="dashboard", user="dashboard", role="admin")
+
+    credentials = _extract_basic_credentials(auth_header)
+    if credentials:
+        user, secret = credentials
+        expected_role = settings.slack_role_map.get(user)
+        if expected_role and expected_role.lower() == secret.lower():
+            role = expected_role.lower()
+            if role in AUTH_ALLOWED_ROLES:
+                return ControlIdentity(principal="slack", user=user, role=role)
+            if required:
+                _auth_failure(
+                    "role_denied",
+                    user=user,
+                    has_token=has_token,
+                    transport=transport,
+                )
+            # Not required: fall back to default identity
+        elif required:
+            _auth_failure(
+                "missing_or_bad_token",
+                user=user,
+                has_token=has_token,
+                transport=transport,
+            )
+
+    if not required:
+        return ControlIdentity(principal="dashboard", user="dashboard", role="admin")
+
+    failing_user = credentials[0] if credentials else None
+    _auth_failure(
+        "missing_or_bad_token",
+        user=failing_user,
+        has_token=has_token,
+        transport=transport,
+    )
+
+
+def _record_dashboard_heartbeat() -> None:
+    bus = Bus(settings.ipc_db)
+    bus.record_heartbeat("dashboard", epoch_ms())
+
+
+async def _heartbeat_loop() -> None:
+    try:
+        while True:
+            _record_dashboard_heartbeat()
+            await asyncio.sleep(_HEARTBEAT_INTERVAL)
+    except asyncio.CancelledError:
+        raise

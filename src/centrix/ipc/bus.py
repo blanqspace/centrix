@@ -253,6 +253,20 @@ class Bus:
             row = cursor.fetchone()
             return row["v"] if row else None
 
+    def set_service_detail(self, component: str, detail: str | None) -> None:
+        """Persist a descriptive detail string for a service."""
+
+        value = detail or ""
+        self.set_kv(f"service_detail:{component}", value)
+
+    def get_service_detail(self, component: str) -> str | None:
+        """Fetch the stored detail string for a service, if any."""
+
+        value = self.get_kv(f"service_detail:{component}")
+        if not value:
+            return None
+        return value
+
     def record_heartbeat(self, component: str, ts_ms: int) -> None:
         """Record a heartbeat timestamp for a component."""
 
@@ -306,6 +320,9 @@ class Bus:
                         elapsed_ms = None
                 if elapsed_ms is not None:
                     entry["elapsed_ms"] = elapsed_ms
+            detail = self.get_service_detail(name)
+            if detail:
+                entry["detail"] = detail
             result[name] = entry
         return result
 
