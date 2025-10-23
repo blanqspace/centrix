@@ -1,0 +1,1 @@
+{"ok":true,"services":{"tui":{"pid":172812,"running":true},"dashboard":{"pid":172813,"running":true},"worker":{"pid":172814,"running":true,"last_heartbeat":1760996013633}}}

@@ -1,0 +1,25 @@
+Phase 2 Smoke 2025-10-20T23:33:07+02:00
+{"mode":"mock","mode_mock":true}
+{"paused":true}
+{"paused":false}
+Started: tui, dashboard, worker; Already running: -
+tui: running pid=172453
+dashboard: running pid=172454
+worker: running pid=172455
+Summary: running=3/3
+Stopped: dashboard; Already stopped: -
+tui: running pid=172453
+dashboard: stopped
+worker: running pid=172455
+Summary: running=2/3
+Started: dashboard; Already running: -
+tui: running pid=172453
+dashboard: running pid=172528
+worker: running pid=172455
+Summary: running=3/3
+TUI smoke
+tmux detached
+Session 'centrix' ready
+Lock contention
+control operations are busy
+Phase 2 smoke complete

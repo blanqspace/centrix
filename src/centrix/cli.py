@@ -64,6 +64,7 @@ SERVICE_MODULES = {
     "dashboard": "centrix.dashboard.server",
     "worker": "centrix.services.confirm_worker",
     "slack": "centrix.services.slack",
+    "ibkr": "centrix.services.ibkr_worker",
 }
 ALLOWED_TARGETS: list[str] = list(SERVICE_MODULES)
 LOCK_NAME = "svc.control"

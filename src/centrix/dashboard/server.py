@@ -39,7 +39,7 @@ from centrix.settings import AppSettings, get_settings
 
 settings = get_settings()
 
-SERVICE_NAMES = ["tui", "dashboard", "worker", "slack"]
+SERVICE_NAMES = ["tui", "dashboard", "worker", "slack", "ibkr"]
 BUILD_INFO = {
     "version": __version__,
     "py": sys.version.split()[0],

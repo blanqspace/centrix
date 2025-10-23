@@ -1,0 +1,35 @@
+{
+  "alerts": {
+    "deduped": 0,
+    "emitted": 0,
+    "throttled": 0
+  },
+  "kpi": {
+    "alerts_dedup_1m": 0,
+    "alerts_throttle_1m": 0,
+    "errors_1m": 0,
+    "open_approvals": 0,
+    "queue_depth": 0
+  },
+  "services": {
+    "dashboard": {
+      "pid": 172813,
+      "running": true
+    },
+    "tui": {
+      "pid": 172812,
+      "running": true
+    },
+    "worker": {
+      "last_heartbeat": 1760996016652,
+      "pid": 172814,
+      "running": true
+    }
+  },
+  "state": {
+    "mode": "mock",
+    "mode_mock": true,
+    "paused": false
+  },
+  "ts": "2025-10-20T23:33:37"
+}

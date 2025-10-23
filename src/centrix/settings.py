@@ -41,6 +41,8 @@ class AppSettings(BaseSettings):
     tws_host: str = "127.0.0.1"
     tws_port: int = 4002
     ibkr_client_id: int = 7
+    ibkr_req_timeout_ms: int = 4_000
+    ibkr_md_snapshot_sec: int = 10
 
     approval_token_length: int = 6
     state_file: str = "runtime/state.json"

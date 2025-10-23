@@ -20,7 +20,7 @@ from centrix.ipc import is_running, pidfile, read_state
 from centrix.ipc.bus import Bus
 from centrix.settings import get_settings
 
-SERVICE_NAMES: list[str] = ["tui", "dashboard", "worker", "slack"]
+SERVICE_NAMES: list[str] = ["tui", "dashboard", "worker", "slack", "ibkr"]
 
 
 class ControlApp(App[None]):

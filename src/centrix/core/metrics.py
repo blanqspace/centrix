@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from statistics import median
 from threading import Lock
 from typing import Any
 
@@ -16,17 +17,23 @@ class KPIStore:
 
     def __init__(self) -> None:
         self._lock = Lock()
+        self._counters: dict[str, int] = {}
         self._errors: deque[float] = deque()
         self._alert_dedup: deque[float] = deque()
         self._alert_throttle: deque[float] = deque()
         self._open_approvals = 0
         self._queue_depth = 0
-        self._counters: dict[str, int] = {}
+        self._ibkr_latency_ms: deque[float] = deque(maxlen=50)
         self._risk: dict[str, float] = {
             "pnl_day": 0.0,
             "pnl_open": 0.0,
             "margin_used_pct": 0.0,
         }
+        self._initialize_default_counters()
+
+    def _initialize_default_counters(self) -> None:
+        self._counters.setdefault("ibkr_errors_total", 0)
+        self._counters.setdefault("ibkr_pacing_violations_total", 0)
 
     def _prune(self, container: deque[float], now: float, window: float) -> None:
         while container and now - container[0] > window:
@@ -60,7 +67,6 @@ class KPIStore:
 
     def update_risk(
         self,
-        *,
         pnl_day: float | None = None,
         pnl_open: float | None = None,
         margin_used_pct: float | None = None,
@@ -75,12 +81,26 @@ class KPIStore:
             if margin_used_pct is not None:
                 self._risk["margin_used_pct"] = float(margin_used_pct)
 
+    def update_ibkr_latency(self, ms: float) -> None:
+        """Record latest IBKR latency sample in milliseconds."""
+
+        if ms < 0:
+            return
+        with self._lock:
+            self._ibkr_latency_ms.append(float(ms))
+
+    def _ibkr_latency_median(self) -> float | None:
+        if not self._ibkr_latency_ms:
+            return None
+        return float(median(self._ibkr_latency_ms))
+
     def snapshot(self) -> dict[str, Any]:
         now_ts = time.time()
         with self._lock:
             self._prune(self._errors, now_ts, ERROR_WINDOW_SEC)
             self._prune(self._alert_dedup, now_ts, ALERT_WINDOW_SEC)
             self._prune(self._alert_throttle, now_ts, ALERT_WINDOW_SEC)
+            ibkr_latency_median = self._ibkr_latency_median()
             snapshot: dict[str, Any] = {
                 "open_approvals": self._open_approvals,
                 "queue_depth": self._queue_depth,
@@ -89,8 +109,8 @@ class KPIStore:
                 "alerts_throttle_1m": len(self._alert_throttle),
                 "risk": dict(self._risk),
             }
-            if self._counters:
-                snapshot["counters"] = dict(self._counters)
+            snapshot["ibkr_latency_ms_median"] = ibkr_latency_median
+            snapshot["counters"] = dict(self._counters)
             return snapshot
 
     def reset(self) -> None:
@@ -103,11 +123,13 @@ class KPIStore:
             self._open_approvals = 0
             self._queue_depth = 0
             self._counters.clear()
+            self._ibkr_latency_ms.clear()
             self._risk = {
                 "pnl_day": 0.0,
                 "pnl_open": 0.0,
                 "margin_used_pct": 0.0,
             }
+            self._initialize_default_counters()
 
     def increment_counter(self, key: str, amount: int = 1) -> None:
         """Increment a named counter used for diagnostics."""

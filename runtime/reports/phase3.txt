@@ -1,0 +1,17 @@
+Phase 3 Smoke 2025-10-20T23:33:31+02:00
+Started: tui, dashboard, worker; Already running: -
+healthz={"ok":true,"services":{"tui":{"pid":172812,"running":true},"dashboard":{"pid":172813,"running":true},"worker":{"pid":172814,"running":true,"last_heartbeat":1760996013633}}}
+metrics={"ts":"2025-10-20T23:33:34","kpi":{"open_approvals":0,"queue_depth":0,"errors_1m":0,"alerts_dedup_1m":0,"alerts_throttle_1m":0},"alerts":{"emitted":0,"deduped":0,"throttled":0},"services":{"tui":{"pid":172812,"running":true},"dashboard":{"pid":172813,"running":true},"worker":{"pid":172814,"running":true,"last_heartbeat":1760996013633}},"build":{"version":"0.1.0","py":"3.12.3","platform":"Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.39"}}
+Simulating alerts
+alerts_emitted=1
+metrics_snapshot={"open_approvals": 0, "queue_depth": 0, "errors_1m": 0, "alerts_dedup_1m": 0, "alerts_throttle_1m": 0}
+Lock lifecycle
+name                    pid      age_s      ttl_s  expired
+phase3.lock          172887        2.2        1.0     true
+removed=1
+Diagnostics snapshot
+runtime/reports/diag_20251020_233337.json
+diag_snapshot=runtime/reports/diag_20251020_233337.json
+TUI smoke
+Stopped: tui, dashboard, worker; Already stopped: -
+Phase 3 smoke complete

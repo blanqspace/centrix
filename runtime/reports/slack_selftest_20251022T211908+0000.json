@@ -1,0 +1,129 @@
+{
+  "run_at": "2025-10-22T21:19:08+00:00",
+  "precheck_ok": true,
+  "precheck_failures": [],
+  "overall_ok": true,
+  "status": "PASS",
+  "summary": {
+    "enabled": true,
+    "simulation": false,
+    "has_app_token": true,
+    "has_bot_token": true,
+    "has_signing": true,
+    "channels_present": {
+      "control": true,
+      "logs": true,
+      "alerts": true,
+      "orders": true
+    },
+    "role_map_count": 2
+  },
+  "checks": [
+    {
+      "check": "env",
+      "target": "tokens/channels",
+      "ok": true,
+      "detail": "bot=xoxb-**** app=xapp-**** signing=yes channels=control:C09MJ2LRFB8,logs:C09ML509XGA,alerts:C09MGLH7L7P,orders:C09ML4Y62N6"
+    },
+    {
+      "check": "auth.test",
+      "target": "api.slack.com",
+      "ok": true,
+      "detail": "user=U09MGN3DALD team=cenrtix"
+    },
+    {
+      "check": "post",
+      "target": "CONTROL",
+      "ok": true,
+      "detail": "ts=1761167947.593299",
+      "kind": "control",
+      "channel": "C09MJ2LRFB8"
+    },
+    {
+      "check": "post",
+      "target": "LOGS",
+      "ok": true,
+      "detail": "ts=1761167947.932759",
+      "kind": "logs",
+      "channel": "C09ML509XGA"
+    },
+    {
+      "check": "post",
+      "target": "ALERTS",
+      "ok": true,
+      "detail": "ts=1761167948.242049",
+      "kind": "alerts",
+      "channel": "C09MGLH7L7P"
+    },
+    {
+      "check": "post",
+      "target": "ORDERS",
+      "ok": true,
+      "detail": "ts=1761167948.530749",
+      "kind": "orders",
+      "channel": "C09ML4Y62N6"
+    },
+    {
+      "check": "socket-mode",
+      "target": "xapp handshake",
+      "ok": true,
+      "detail": "connected"
+    }
+  ],
+  "auth": {
+    "ok": true,
+    "user_id": "U09MGN3DALD",
+    "team": "cenrtix",
+    "error": null,
+    "code": null
+  },
+  "channels": [
+    {
+      "kind": "control",
+      "channel": "C09MJ2LRFB8",
+      "ok": true,
+      "ts": "1761167947.593299",
+      "error": null,
+      "code": null,
+      "detail": "ts=1761167947.593299"
+    },
+    {
+      "kind": "logs",
+      "channel": "C09ML509XGA",
+      "ok": true,
+      "ts": "1761167947.932759",
+      "error": null,
+      "code": null,
+      "detail": "ts=1761167947.932759"
+    },
+    {
+      "kind": "alerts",
+      "channel": "C09MGLH7L7P",
+      "ok": true,
+      "ts": "1761167948.242049",
+      "error": null,
+      "code": null,
+      "detail": "ts=1761167948.242049"
+    },
+    {
+      "kind": "orders",
+      "channel": "C09ML4Y62N6",
+      "ok": true,
+      "ts": "1761167948.530749",
+      "error": null,
+      "code": null,
+      "detail": "ts=1761167948.530749"
+    }
+  ],
+  "socket_mode": {
+    "ok": true,
+    "error": null,
+    "code": null
+  },
+  "errors": [],
+  "masked_tokens": {
+    "bot_token": "xoxb-****",
+    "app_token": "xapp-****",
+    "signing_secret": "5e6a****"
+  }
+}

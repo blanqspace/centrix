@@ -31,6 +31,9 @@ def test_metrics_sliding_window(monkeypatch) -> None:
     assert snapshot["risk"]["pnl_day"] == pytest.approx(12.5)
     assert snapshot["risk"]["pnl_open"] == pytest.approx(-3.2)
     assert snapshot["risk"]["margin_used_pct"] == pytest.approx(27.5)
+    assert snapshot["ibkr_latency_ms_median"] is None
+    assert snapshot["counters"]["ibkr_errors_total"] == 0
+    assert snapshot["counters"]["ibkr_pacing_violations_total"] == 0
 
     current["value"] += 61
     snapshot_late = snapshot_kpis()
@@ -40,3 +43,17 @@ def test_metrics_sliding_window(monkeypatch) -> None:
     assert snapshot_late["open_approvals"] == 3
     assert snapshot_late["queue_depth"] == 5
     assert snapshot_late["risk"]["pnl_day"] == pytest.approx(12.5)
+
+
+def test_metrics_ibkr_latency_and_counters() -> None:
+    METRICS.reset()
+    METRICS.update_ibkr_latency(10.0)
+    METRICS.update_ibkr_latency(30.0)
+    METRICS.update_ibkr_latency(20.0)
+    METRICS.increment_counter("ibkr_errors_total", 2)
+    METRICS.increment_counter("ibkr_pacing_violations_total", 1)
+
+    snapshot = snapshot_kpis()
+    assert snapshot["ibkr_latency_ms_median"] == pytest.approx(20.0)
+    assert snapshot["counters"]["ibkr_errors_total"] == 2
+    assert snapshot["counters"]["ibkr_pacing_violations_total"] == 1
