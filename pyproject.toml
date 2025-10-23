@@ -17,6 +17,8 @@ dependencies = [
     "textual>=0.48",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
+    "python-dotenv>=1.0",
+    "slack-bolt>=1.18",
     "slack_sdk>=3.30",
     "ib-insync>=0.9",
 ]
