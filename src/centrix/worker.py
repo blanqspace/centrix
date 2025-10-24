@@ -43,7 +43,7 @@ def _connect() -> sqlite3.Connection:
 def _expire_stale(conn: sqlite3.Connection, now: float) -> None:
     rows = conn.execute(
         """
-        SELECT cmd_id, ttl_sec FROM commands
+        SELECT cmd_id, ttl_sec, type FROM commands
         WHERE status='NEW' AND ttl_sec IS NOT NULL AND created_at + ttl_sec <= ?
         """,
         (now,),
@@ -52,9 +52,16 @@ def _expire_stale(conn: sqlite3.Connection, now: float) -> None:
     for row in rows:
         cmd_id = row["cmd_id"]
         ttl = row["ttl_sec"]
+        cmd_type = (row["type"] or "unknown").lower()
         with conn:
             conn.execute("UPDATE commands SET status='EXPIRED' WHERE cmd_id=?", (cmd_id,))
-        append_event(cmd_id, "WARN", "Command expired", {"ttl_sec": ttl})
+        append_event(
+            cmd_id,
+            "WARN",
+            "Command expired",
+            {"ttl_sec": ttl},
+            topic=f"cmd.{cmd_type}.expired",
+        )
         log.info("Expired command %s (ttl=%s)", cmd_id, ttl)
 
 
@@ -88,14 +95,27 @@ def _process_once() -> bool:
         payload = _load_json(row["payload"])
         log.info("Executing command %s type=%s by=%s", cmd_id, row["type"], row["requested_by"])
 
+        cmd_type = (row["type"] or "unknown").lower()
         try:
             time.sleep(0.2)
-            append_event(cmd_id, "INFO", "EXEC_OK", {"payload": payload})
+            append_event(
+                cmd_id,
+                "INFO",
+                "EXEC_OK",
+                {"payload": payload},
+                topic=f"cmd.{cmd_type}.ok",
+            )
             with conn:
                 conn.execute("UPDATE commands SET status='DONE' WHERE cmd_id=?", (cmd_id,))
             log.info("Command %s completed", cmd_id)
         except Exception as exc:
-            append_event(cmd_id, "ERROR", "EXEC_FAIL", {"error": str(exc)})
+            append_event(
+                cmd_id,
+                "ERROR",
+                "EXEC_FAIL",
+                {"error": str(exc)},
+                topic=f"cmd.{cmd_type}.fail",
+            )
             with conn:
                 conn.execute("UPDATE commands SET status='FAIL' WHERE cmd_id=?", (cmd_id,))
             log.exception("Command %s failed: %s", cmd_id, exc)

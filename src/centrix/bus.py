@@ -18,24 +18,29 @@ _DB_PATH: Path | None = None
 
 _CREATE_COMMANDS = """
 CREATE TABLE IF NOT EXISTS commands(
-    cmd_id TEXT PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cmd_id TEXT UNIQUE,
     type TEXT NOT NULL,
     payload TEXT NOT NULL,
-    status TEXT NOT NULL,
-    requested_by TEXT NOT NULL,
-    role TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    ttl_sec INTEGER
+    status TEXT NOT NULL DEFAULT 'NEW',
+    requested_by TEXT,
+    role TEXT,
+    ttl_sec INTEGER,
+    corr_id TEXT,
+    created_at REAL NOT NULL
 );
 """
 
 _CREATE_EVENTS = """
 CREATE TABLE IF NOT EXISTS events(
-    eid TEXT PRIMARY KEY,
-    cmd_id TEXT NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    eid TEXT UNIQUE,
+    cmd_id TEXT,
+    topic TEXT NOT NULL,
     level TEXT NOT NULL,
-    message TEXT NOT NULL,
-    data TEXT,
+    message TEXT,
+    data TEXT NOT NULL,
+    corr_id TEXT,
     created_at REAL NOT NULL
 );
 """
@@ -58,8 +63,18 @@ def init_db(path: str | Path = "runtime/ctl.db") -> Path:
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA foreign_keys=OFF;")
-            _ensure_table(conn, "commands", _CREATE_COMMANDS, {"cmd_id", "type", "payload", "status", "requested_by", "role", "created_at", "ttl_sec"})
-            _ensure_table(conn, "events", _CREATE_EVENTS, {"eid", "cmd_id", "level", "message", "data", "created_at"})
+            _ensure_table(
+                conn,
+                "commands",
+                _CREATE_COMMANDS,
+                {"id", "cmd_id", "type", "payload", "status", "requested_by", "role", "created_at", "ttl_sec", "corr_id"},
+            )
+            _ensure_table(
+                conn,
+                "events",
+                _CREATE_EVENTS,
+                {"id", "eid", "cmd_id", "topic", "level", "data", "created_at", "corr_id"},
+            )
             for ddl in _CREATE_IDX:
                 conn.execute(ddl)
             conn.commit()
@@ -125,9 +140,9 @@ def _get_columns(conn: sqlite3.Connection, name: str) -> set[str] | None:
     return {row[1] for row in info}
 
 
-def _json(payload: dict[str, Any] | None) -> str | None:
+def _json(payload: dict[str, Any] | None) -> str:
     if payload is None:
-        return None
+        return "{}"
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
@@ -156,10 +171,10 @@ def enqueue_command(
         with conn:
             conn.execute(
                 """
-                INSERT INTO commands(cmd_id, type, payload, status, requested_by, role, created_at, ttl_sec)
-                VALUES(?,?,?,?,?,?,?,?)
+                INSERT INTO commands(cmd_id, type, payload, status, requested_by, role, created_at, ttl_sec, corr_id)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 """,
-                record,
+                (*record, None),
             )
     finally:
         conn.close()
@@ -172,20 +187,23 @@ def append_event(
     level: str,
     message: str,
     data: dict[str, Any] | None = None,
+    *,
+    topic: str | None = None,
 ) -> None:
     """Append an event for a command."""
     eid = str(uuid.uuid4())
     created_at = time.time()
     payload = _json(data)
+    event_topic = topic or f"cmd.{level.lower()}"
     conn = _connect()
     try:
         with conn:
             conn.execute(
                 """
-                INSERT INTO events(eid, cmd_id, level, message, data, created_at)
-                VALUES(?,?,?,?,?,?)
+                INSERT INTO events(eid, cmd_id, topic, level, message, data, created_at)
+                VALUES(?,?,?,?,?,?,?)
                 """,
-                (eid, cmd_id, level.upper(), message, payload, created_at),
+                (eid, cmd_id, event_topic, level.upper(), message, payload, created_at),
             )
     finally:
         conn.close()

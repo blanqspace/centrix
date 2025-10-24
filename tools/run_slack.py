@@ -39,6 +39,9 @@ def main() -> int:
 
     try:
         run_socket_mode(app_token, app)
+    except KeyboardInterrupt:
+        log.info("Slack Socket Mode interrupted by user")
+        return 0
     except Exception:
         log.exception("Slack Socket Mode terminated with error")
         return 1

@@ -329,14 +329,23 @@ def run_socket_mode(app_token: str, app: App) -> None:
 
     handler = SocketModeHandler(app, app_token)
     stop_event = threading.Event()
+    closed = threading.Event()
 
-    def _shutdown(signum: int, _frame: Any) -> None:
-        log.info("signal %s received, stopping Slack socket mode", signum)
-        stop_event.set()
+    def _close_handler() -> None:
+        if closed.is_set():
+            return
+        closed.set()
         try:
             handler.close()
         except SlackClientError:
             log.warning("Socket handler close raised SlackClientError", exc_info=True)
+
+    def _shutdown(signum: int, _frame: Any) -> None:
+        first = not stop_event.is_set()
+        stop_event.set()
+        if first:
+            log.info("Slack socket mode shutdown requested (signal=%s)", signum)
+        _close_handler()
 
     previous_sigint = signal.getsignal(signal.SIGINT)
     previous_sigterm = signal.getsignal(signal.SIGTERM)
@@ -355,18 +364,19 @@ def run_socket_mode(app_token: str, app: App) -> None:
     log.info("Socket mode started (app_token=%s)", mask(app_token, show=4))
 
     try:
-        while thread.is_alive():
-            thread.join(timeout=0.5)
+        while thread.is_alive() and not stop_event.is_set():
+            thread.join(timeout=0.2)
     except KeyboardInterrupt:
         _shutdown(signal.SIGINT, None)
     finally:
         stop_event.set()
-        try:
-            handler.close()
-        except SlackClientError:
-            log.warning("Socket handler close raised SlackClientError", exc_info=True)
-        thread.join(timeout=3.0)
+        _close_handler()
+        thread.join(timeout=2.0)
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
+        alive = thread.is_alive()
         lock.release()
-        log.info("Socket mode stopped")
+        if alive:
+            log.warning("Socket thread still alive after shutdown; forcing exit")
+            os._exit(0)
+        log.info("Slack socket mode stopped cleanly")
