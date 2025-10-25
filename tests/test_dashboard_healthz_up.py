@@ -2,20 +2,27 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from pathlib import Path
-from typing import Any
 
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
-from centrix.dashboard.server import SERVICE_NAMES, Bus, healthz
+from centrix.dashboard import server
 
 
 def test_healthz_up(monkeypatch) -> None:
-    def fake_status(self: Bus, services: list[str]) -> dict[str, dict[str, Any]]:
-        return {name: {"running": True} for name in services}
+    now = time.time()
 
-    monkeypatch.setattr(Bus, "get_services_status", fake_status, raising=False)
+    def fake_services() -> dict[str, dict[str, Any]]:
+        return {
+            "worker": {"last_seen": now, "state": "up"},
+            "slack": {"last_seen": now - 5, "state": "up"},
+        }
 
-    payload = asyncio.run(healthz())
+    monkeypatch.setattr(server, "get_services", fake_services, raising=False)
+
+    payload = asyncio.run(server.healthz())
     assert payload["ok"] is True
-    assert set(payload["services"]) == set(SERVICE_NAMES)
+    assert set(payload["services"]) == {"worker", "slack"}
+    assert payload["services"]["worker"]["status"] == "up"
+    assert payload["services"]["slack"]["status"] == "up"

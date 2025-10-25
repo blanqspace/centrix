@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from typing import Any
 
-from .bus import append_event, init_db
+from .bus import append_event, init_db, touch_service
 
 log = logging.getLogger("centrix.worker")
 
@@ -17,10 +18,16 @@ def run_worker(poll_sec: float = 1.0) -> None:
     """Continuously pull commands from the queue and execute them."""
     db_path = init_db()
     log.info("Worker started (db=%s poll=%.1fs)", db_path, poll_sec)
+    touch_service("worker", "up", {"pid": os.getpid()})
+    last_touch = time.time()
     try:
         while True:
             try:
                 processed = _process_once()
+                now = time.time()
+                if now - last_touch >= 3.0:
+                    touch_service("worker", "up")
+                    last_touch = now
                 if not processed:
                     time.sleep(poll_sec)
             except KeyboardInterrupt:
@@ -30,6 +37,8 @@ def run_worker(poll_sec: float = 1.0) -> None:
                 time.sleep(poll_sec)
     except KeyboardInterrupt:
         log.info("Worker interrupted, shutting down")
+    finally:
+        touch_service("worker", "down", {"reason": "shutdown"})
     log.info("Worker stopped")
 
 

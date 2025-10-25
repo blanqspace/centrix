@@ -8,6 +8,7 @@ import os
 import platform
 import secrets
 import sys
+import time
 from base64 import b64decode
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from starlette.requests import ClientDisconnect
 
 from centrix import __version__
+from centrix.bus import get_services, touch_service
 from centrix.cli import _parse_targets, _start_service, _stop_service
 from centrix.core.alerts import alert_counters
 from centrix.core.approvals import request_approval
@@ -33,7 +35,7 @@ from centrix.core.logging import log_event, warn_on_local_env
 from centrix.core.metrics import METRICS, snapshot_kpis
 from centrix.core.rbac import allow
 from centrix.core.orders import add_order, list_orders
-from centrix.ipc import epoch_ms, read_state, write_state
+from centrix.ipc import read_state, write_state
 from centrix.ipc.bus import Bus
 from centrix.settings import AppSettings, get_settings
 
@@ -52,6 +54,7 @@ LAST_ACTION: dict[str, Any] | None = None
 AUTH_ALLOWED_ROLES = {"observer", "operator", "admin"}
 _HEARTBEAT_INTERVAL = 5.0
 _HEARTBEAT_TASK: asyncio.Task | None = None
+HEALTH_WINDOW = 10.0
 
 
 @dataclass(slots=True)
@@ -372,13 +375,13 @@ INDEX_HTML = """<!DOCTYPE html>
         const lastDiv = document.getElementById('last-action');
 
         const connectivity = data.connectivity || {};
-        const slackRaw = String(connectivity.slack ?? 'unknown').toLowerCase();
-        const slackStatus = ['up', 'down', 'unknown'].includes(slackRaw) ? slackRaw : 'unknown';
+        const slackRaw = connectivity.slack;
+        const slackStatus = slackRaw ? String(slackRaw).toUpperCase() : 'N/A';
         const statusItems = [
           ['Mode', data.mode ?? '-'],
           ['Paused', data.paused ? 'Ja' : 'Nein'],
           ['Heartbeat', data.heartbeat ?? '-'],
-          ['Slack', slackStatus.toUpperCase()],
+          ['Slack', slackStatus],
         ];
         systemDiv.innerHTML = statusItems
           .map(([label, value]) => `<div><span>${label}</span><strong>${escapeHtml(value)}</strong></div>`)
@@ -688,41 +691,35 @@ def status_payload(last_action: dict[str, Any] | None = None) -> dict[str, Any]:
         LAST_ACTION = last_action
     snapshot_last_action = LAST_ACTION
 
-    bus = Bus(settings.ipc_db)
     state = read_state() or {}
-    services = bus.get_services_status(SERVICE_NAMES)
+    service_snapshot = get_services()
+    services: dict[str, dict[str, Any]] = {}
     slack_detail = _load_slack_selftest_detail()
-    if slack_detail is not None:
-        if "slack" in services and isinstance(services["slack"], dict):
-            services["slack"]["detail"] = slack_detail
-        else:
-            services["slack"] = {"detail": slack_detail}
+    now = time.time()
+    connectivity: dict[str, str] = {}
+    for name, info in service_snapshot.items():
+        last_seen = float(info.get("last_seen", 0.0))
+        state_flag = str(info.get("state") or "unknown")
+        is_up = state_flag == "up" and now - last_seen <= HEALTH_WINDOW
+        status = "up" if is_up else "down"
+        entry: dict[str, Any] = {
+            "state": state_flag,
+            "last_seen": last_seen,
+            "status": status,
+        }
+        details = info.get("details")
+        if isinstance(details, dict):
+            entry["details"] = details
+        services[name] = entry
+        connectivity[name] = status
+    if slack_detail is not None and "slack" in services:
+        services["slack"]["detail"] = slack_detail
+    bus = Bus(settings.ipc_db)
     kpi = snapshot_kpis()
     orders = list_orders()
     events = bus.tail_events(limit=EVENT_LIMIT)
     clients = list(CLIENTS.values())
     heartbeat = datetime.now(UTC).isoformat(timespec="seconds") + "Z"
-
-    now_ms = epoch_ms()
-    connectivity: dict[str, str] = {}
-    for name in SERVICE_NAMES:
-        info = services.get(name)
-        status = "unknown"
-        if isinstance(info, dict):
-            heartbeat_ms: int | None = None
-            heartbeat_raw = info.get("last_heartbeat")
-            if heartbeat_raw is not None:
-                try:
-                    heartbeat_ms = int(heartbeat_raw)
-                except (TypeError, ValueError):
-                    heartbeat_ms = None
-            if info.get("running") is True:
-                status = "up"
-            elif info.get("running") is False:
-                status = "down"
-            if heartbeat_ms is not None and now_ms - heartbeat_ms <= 10_000:
-                status = "up"
-        connectivity[name] = status
 
     risk_snapshot = kpi.get("risk") if isinstance(kpi, dict) else None
     risk_payload = {
@@ -789,18 +786,27 @@ async def index() -> HTMLResponse:
 
 @app.get("/healthz", response_class=JSONResponse)
 async def healthz() -> dict[str, Any]:
-    services: dict[str, dict[str, Any]]
-    try:
-        bus = Bus(settings.ipc_db)
-        services = bus.get_services_status(SERVICE_NAMES)
-    except Exception as exc:  # pragma: no cover - defensive
-        services = {"error": {"message": str(exc)}}
-    else:
-        for required_name in ("dashboard", "worker", "slack"):
-            services.setdefault(required_name, {})
+    snapshot = get_services()
+    now = time.time()
+    statuses: dict[str, dict[str, Any]] = {}
+    for name, info in snapshot.items():
+        last_seen = float(info.get("last_seen", 0.0))
+        state = str(info.get("state") or "unknown")
+        status = "down"
+        if state == "up" and now - last_seen <= HEALTH_WINDOW:
+            status = "up"
+        entry = {
+            "state": state,
+            "last_seen": last_seen,
+            "status": status,
+        }
+        details = info.get("details")
+        if isinstance(details, dict):
+            entry["details"] = details
+        statuses[name] = entry
     return {
         "ok": True,
-        "services": services,
+        "services": statuses,
         "ts": datetime.now(UTC).isoformat(),
     }
 
@@ -1168,8 +1174,7 @@ def _resolve_identity(
 
 
 def _record_dashboard_heartbeat() -> None:
-    bus = Bus(settings.ipc_db)
-    bus.record_heartbeat("dashboard", epoch_ms())
+    touch_service("dashboard", "up", {"pid": os.getpid()})
 
 
 async def _heartbeat_loop() -> None:
@@ -1179,3 +1184,5 @@ async def _heartbeat_loop() -> None:
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
     except asyncio.CancelledError:
         raise
+    finally:
+        touch_service("dashboard", "down", {"reason": "shutdown", "pid": os.getpid()})

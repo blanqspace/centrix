@@ -59,3 +59,13 @@
 {"ts":"2025-10-22T21:29:56+00:00","channel":"C09ML509XGA","text":"Slack selftest PASS (OK) at 2025-10-22T21:29:50+00:00","thread_ts":null,"blocks":[],"metadata":{"type":"selftest"}}
 {"ts":"2025-10-22T21:30:54+00:00","channel":"C09ML509XGA","text":"Slack selftest PASS (OK) at 2025-10-22T21:30:49+00:00","thread_ts":null,"blocks":[],"metadata":{"type":"selftest"}}
 {"ts":"2025-10-22T21:47:34+00:00","channel":"C09ML509XGA","text":"Slack selftest PASS (OK) at 2025-10-22T21:47:30+00:00","thread_ts":null,"blocks":[],"metadata":{"type":"selftest"}}
+{"ts":"2025-10-25T02:06:38+00:00","channel":"#centrix","text":"[ERROR] svc.test: failure","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:06:38+00:00","channel":"#centrix","text":"[ERROR] svc.test: first","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:07:21+00:00","channel":"#centrix","text":"[ERROR] svc.test: failure","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:07:21+00:00","channel":"#centrix","text":"[ERROR] svc.test: first","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:07:55+00:00","channel":"#centrix","text":"[ERROR] svc.test: failure","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:07:55+00:00","channel":"#centrix","text":"[ERROR] svc.test: first","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:09:08+00:00","channel":"#centrix","text":"[ERROR] svc.test: failure","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:09:08+00:00","channel":"#centrix","text":"[ERROR] svc.test: first","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:14:46+00:00","channel":"#centrix","text":"[ERROR] svc.test: failure","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}
+{"ts":"2025-10-25T02:14:46+00:00","channel":"#centrix","text":"[ERROR] svc.test: first","thread_ts":null,"blocks":[],"metadata":{"fields":{"fingerprint":"fp-1"},"topic":"svc.test","level":"ERROR"}}

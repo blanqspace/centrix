@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Any, Callable, Protocol
 
 from dotenv import load_dotenv
 
+from centrix.bus import touch_service
 from centrix.core.metrics import KPIStore, METRICS
 from centrix.settings import AppSettings
 from centrix.utils.logging_setup import setup_logging
@@ -136,6 +138,10 @@ class IbkrClient:
         self._sleep = sleep_fn
         self._connected = False
         self._last_error: dict[str, Any] | None = None
+        self._hb_lock = threading.Lock()
+        self._hb_thread: threading.Thread | None = None
+        self._hb_stop: threading.Event | None = None
+        self._hb_details: dict[str, Any] | None = None
 
     @property
     def enabled(self) -> bool:
@@ -188,6 +194,7 @@ class IbkrClient:
                 if self._gateway.is_connected():
                     self._connected = True
                     self._last_error = None
+                    self._start_heartbeat({"host": host, "port": port})
                     CLIENT_LOG.info(
                         "IBKR gateway connection established host=%s port=%s client_id=%s",
                         host,
@@ -217,6 +224,7 @@ class IbkrClient:
             client_id,
         )
         self._connected = False
+        self._mark_down({"error": "connect-failed"})
         return False
 
     def disconnect(self) -> None:
@@ -228,6 +236,8 @@ class IbkrClient:
         CLIENT_LOG.info("Disconnecting from IBKR gateway")
         self._gateway.disconnect()
         self._connected = False
+        self._stop_heartbeat()
+        self._mark_down({"reason": "disconnect"})
         CLIENT_LOG.info("IBKR gateway disconnected")
 
     def health(self) -> dict[str, Any]:
@@ -307,6 +317,10 @@ class IbkrClient:
             info.severity,
             detail,
         )
+        extra = {"error": detail}
+        if code != -1:
+            extra["code"] = code
+        self._mark_down(extra)
         return info
 
     def map_error(self, code: int) -> IbkrErrorInfo:
@@ -318,6 +332,58 @@ class IbkrClient:
         code = getattr(exc, "code", -1)
         message = str(exc)
         return self.record_error(code=code, message=message)
+
+    def _start_heartbeat(self, details: dict[str, Any]) -> None:
+        if not details:
+            details = {}
+        payload = dict(details)
+        with self._hb_lock:
+            if self._hb_stop is not None:
+                self._hb_stop.set()
+            if self._hb_thread is not None and self._hb_thread.is_alive():
+                self._hb_thread.join(timeout=0.5)
+            stop_event = threading.Event()
+            self._hb_stop = stop_event
+            self._hb_details = payload
+
+            def _heartbeat_loop() -> None:
+                try:
+                    while not stop_event.is_set():
+                        touch_service("ibkr", "up", payload)
+                        if stop_event.wait(3.0):
+                            break
+                except Exception:  # pragma: no cover - defensive
+                    CLIENT_LOG.exception("IBKR heartbeat loop failed")
+
+            thread = threading.Thread(
+                target=_heartbeat_loop,
+                name="centrix-ibkr-heartbeat",
+                daemon=True,
+            )
+            self._hb_thread = thread
+            touch_service("ibkr", "up", payload)
+            thread.start()
+
+    def _stop_heartbeat(self) -> None:
+        with self._hb_lock:
+            stop_event = self._hb_stop
+            thread = self._hb_thread
+            self._hb_stop = None
+            self._hb_thread = None
+            self._hb_details = None
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+
+    def _mark_down(self, extra: dict[str, Any] | None = None) -> None:
+        details: dict[str, Any] = {
+            "host": self._settings.tws_host,
+            "port": self._settings.tws_port,
+        }
+        if extra:
+            details.update(extra)
+        touch_service("ibkr", "down", details)
 
 
 def _probe_gateway(host: str, port: int, timeout: float) -> tuple[bool, str | None]:
@@ -357,6 +423,8 @@ def _run_monitor(settings: AppSettings, *, interval: float, timeout: float) -> i
             ok, detail = _probe_gateway(host, port, timeout)
             if ok and reachable is not True:
                 RUNNER_LOG.info("Gateway reachable at %s:%s", host, port)
+            if ok:
+                touch_service("ibkr", "up", {"host": host, "port": port})
             elif not ok and reachable is not False:
                 RUNNER_LOG.warning(
                     "Gateway unreachable at %s:%s (%s)",
@@ -364,6 +432,11 @@ def _run_monitor(settings: AppSettings, *, interval: float, timeout: float) -> i
                     port,
                     detail or "connection failed",
                 )
+            if not ok:
+                down_payload = {"host": host, "port": port}
+                if detail:
+                    down_payload["error"] = detail
+                touch_service("ibkr", "down", down_payload)
             reachable = ok
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -387,6 +460,11 @@ def main() -> int:
     )
 
     if not settings.ibkr_enabled:
+        touch_service(
+            "ibkr",
+            "down",
+            {"reason": "disabled", "host": settings.tws_host, "port": settings.tws_port},
+        )
         RUNNER_LOG.warning("IBKR adapter disabled via IBKR_ENABLED=0; sleeping.")
         try:
             while True:
@@ -395,9 +473,15 @@ def main() -> int:
             RUNNER_LOG.info("Shutdown requested while adapter disabled.")
             return 0
 
-    interval = max(1.0, _env_float("IBKR_HEALTH_INTERVAL", 5.0))
+    interval = max(1.0, _env_float("IBKR_HEALTH_INTERVAL", 3.0))
     timeout = max(0.5, _env_float("IBKR_CONNECT_TIMEOUT", 2.5))
-    return _run_monitor(settings, interval=interval, timeout=timeout)
+    result = _run_monitor(settings, interval=interval, timeout=timeout)
+    touch_service(
+        "ibkr",
+        "down",
+        {"reason": "adapter-stop", "host": settings.tws_host, "port": settings.tws_port},
+    )
+    return result
 
 
 if __name__ == "__main__":

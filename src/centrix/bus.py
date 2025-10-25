@@ -45,6 +45,15 @@ CREATE TABLE IF NOT EXISTS events(
 );
 """
 
+_CREATE_STATUS = """
+CREATE TABLE IF NOT EXISTS svc_status(
+    service TEXT PRIMARY KEY,
+    last_seen REAL NOT NULL,
+    state TEXT NOT NULL,
+    details TEXT
+);
+"""
+
 _CREATE_IDX = (
     "CREATE INDEX IF NOT EXISTS idx_commands_status_created ON commands(status, created_at);",
     "CREATE INDEX IF NOT EXISTS idx_events_cmd_created ON events(cmd_id, created_at);",
@@ -57,8 +66,6 @@ def init_db(path: str | Path = "runtime/ctl.db") -> Path:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with _DB_LOCK:
         global _DB_PATH
-        if _DB_PATH is not None and _DB_PATH == db_path and db_path.exists():
-            return _DB_PATH
         conn = sqlite3.connect(db_path)
         try:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -74,6 +81,12 @@ def init_db(path: str | Path = "runtime/ctl.db") -> Path:
                 "events",
                 _CREATE_EVENTS,
                 {"id", "eid", "cmd_id", "topic", "level", "data", "created_at", "corr_id"},
+            )
+            _ensure_table(
+                conn,
+                "svc_status",
+                _CREATE_STATUS,
+                {"service", "last_seen", "state", "details"},
             )
             for ddl in _CREATE_IDX:
                 conn.execute(ddl)
@@ -146,6 +159,16 @@ def _json(payload: dict[str, Any] | None) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
 
 
+def _status_db_path() -> Path:
+    with _DB_LOCK:
+        global _DB_PATH
+        if _DB_PATH is None:
+            _DB_PATH = Path("runtime/ctl.db")
+        path = _DB_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def enqueue_command(
     type: str,
     payload: dict[str, Any],
@@ -208,3 +231,73 @@ def append_event(
     finally:
         conn.close()
     log.debug("Appended event %s -> %s %s", eid, cmd_id, message)
+
+
+def touch_service(name: str, state: str = "up", details: dict[str, Any] | None = None) -> None:
+    """Upsert the status record for a service."""
+
+    path = _status_db_path()
+    now = time.time()
+    payload = _json(details) if details is not None else None
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(_CREATE_STATUS.strip())
+            conn.execute(
+                """
+                INSERT INTO svc_status(service, last_seen, state, details)
+                VALUES(?, ?, ?, ?)
+                ON CONFLICT(service) DO UPDATE SET
+                    last_seen=excluded.last_seen,
+                    state=excluded.state,
+                    details=excluded.details
+                """,
+                (name, now, state, payload),
+            )
+    except Exception:  # pragma: no cover - defensive
+        log.exception("Failed to update svc_status for %s", name)
+
+
+def _parse_details(raw: str | None) -> dict[str, Any] | None:
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else {"value": value}
+
+
+def get_services() -> dict[str, dict[str, Any]]:
+    """Return a snapshot of recorded service statuses."""
+
+    path = _status_db_path()
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(_CREATE_STATUS.strip())
+            rows = conn.execute(
+                "SELECT service, last_seen, state, details FROM svc_status ORDER BY service"
+            ).fetchall()
+    except Exception:  # pragma: no cover - defensive
+        log.exception("Failed to query svc_status")
+        return {}
+
+    snapshot: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        name = str(row["service"])
+        last_seen_raw = row["last_seen"]
+        try:
+            last_seen = float(last_seen_raw)
+        except (TypeError, ValueError):
+            last_seen = 0.0
+        entry: dict[str, Any] = {
+            "last_seen": last_seen,
+            "state": str(row["state"]),
+        }
+        details = _parse_details(row["details"])
+        if details is not None:
+            entry["details"] = details
+        snapshot[name] = entry
+    return snapshot

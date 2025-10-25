@@ -14,7 +14,7 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk.errors import SlackApiError, SlackClientError
 
-from ..bus import enqueue_command, init_db
+from ..bus import enqueue_command, init_db, touch_service
 from ..utils.env import get_env_str, get_role_map, mask
 
 log = logging.getLogger("centrix.slack")
@@ -28,6 +28,7 @@ _LOCK_PATH = Path("runtime/locks/slack.lock")
 _MAX_POST_ATTEMPTS = 3
 _RETRYABLE_ERRORS = {"ratelimited", "rate_limited", "internal_error"}
 _TRUTHY_VALUES = {"1", "true", "TRUE", "yes", "on", "ON"}
+_HEARTBEAT_INTERVAL = 3.0
 
 
 def _pid_alive(pid: int) -> bool:
@@ -330,6 +331,24 @@ def run_socket_mode(app_token: str, app: App) -> None:
     handler = SocketModeHandler(app, app_token)
     stop_event = threading.Event()
     closed = threading.Event()
+    session_id = f"{os.getpid()}-{int(time.time())}"
+    touch_service("slack", "up", {"session": session_id})
+
+    def _heartbeat_loop() -> None:
+        try:
+            while not stop_event.is_set():
+                touch_service("slack", "up", {"session": session_id})
+                if stop_event.wait(_HEARTBEAT_INTERVAL):
+                    break
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Slack heartbeat loop failed")
+
+    heartbeat_thread = threading.Thread(
+        target=_heartbeat_loop,
+        name="centrix-slack-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
 
     def _close_handler() -> None:
         if closed.is_set():
@@ -374,6 +393,9 @@ def run_socket_mode(app_token: str, app: App) -> None:
         thread.join(timeout=2.0)
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
+        stop_event.set()
+        heartbeat_thread.join(timeout=2.0)
+        touch_service("slack", "down", {"session": session_id})
         alive = thread.is_alive()
         lock.release()
         if alive:
