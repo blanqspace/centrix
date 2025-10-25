@@ -837,17 +837,30 @@ def create_app() -> FastAPI:
 
 
 if __name__ == "__main__":
+    import logging
+    import sys
     import uvicorn
 
+    logger = logging.getLogger("centrix.dashboard.runner")
     settings_override = AppSettings()
 
-    uvicorn.run(
+    config = uvicorn.Config(
         "centrix.dashboard.server:create_app",
         host=settings_override.dashboard_host,
         port=settings_override.dashboard_port,
         factory=True,
         log_level="info",
     )
+    server = uvicorn.Server(config)
+    try:
+        server.run()
+    except KeyboardInterrupt:
+        logger.info("Dashboard stopped cleanly")
+        sys.exit(0)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception("Dashboard server crashed")
+        sys.exit(1)
+    logger.info("Dashboard stopped cleanly")
 
 
 def _toggle_mode(current: dict[str, Any], value: str | None) -> dict[str, Any]:
