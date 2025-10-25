@@ -1,7 +1,8 @@
 .venv/
 .env
-.env.archive
- runtime/
+.env.*
+runtime/**
+!runtime/.gitkeep
 __pycache__/
 *.pyc
 *.egg-info/

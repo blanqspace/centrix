@@ -2,12 +2,62 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import socket
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Protocol
+
+from dotenv import load_dotenv
 
 from centrix.core.metrics import KPIStore, METRICS
 from centrix.settings import AppSettings
+from centrix.utils.logging_setup import setup_logging
+
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+LOG_PATH = Path("runtime/logs/ibkr.log")
+LOGGER_NAME = "centrix.ibkr"
+
+BASE_LOGGER = logging.getLogger(LOGGER_NAME)
+CLIENT_LOG = BASE_LOGGER.getChild("client")
+RUNNER_LOG = BASE_LOGGER.getChild("runner")
+
+_SEVERITY_TO_LEVEL = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
+
+def _ensure_log_handler() -> logging.Logger:
+    """Ensure the dedicated IBKR file handler is installed."""
+
+    setup_logging()
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    target = LOG_PATH.resolve()
+    for handler in BASE_LOGGER.handlers:
+        if isinstance(handler, logging.FileHandler):
+            try:
+                existing = Path(handler.baseFilename).resolve()
+            except OSError:
+                continue
+            if existing == target:
+                break
+    else:
+        handler = logging.FileHandler(target)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        handler.setLevel(logging.INFO)
+        BASE_LOGGER.addHandler(handler)
+
+    if BASE_LOGGER.level == logging.NOTSET:
+        BASE_LOGGER.setLevel(logging.INFO)
+    return BASE_LOGGER
 
 
 class IbkrGateway(Protocol):
@@ -113,29 +163,59 @@ class IbkrClient:
         if self._gateway is None:
             raise RuntimeError("IBKR gateway not provided")
 
-        for attempt in range(1, max(1, retries) + 1):
+        host = self._settings.tws_host
+        port = self._settings.tws_port
+        client_id = self._settings.ibkr_client_id
+        max_attempts = max(1, retries)
+
+        for attempt in range(1, max_attempts + 1):
             start = self._time()
             try:
+                CLIENT_LOG.info(
+                    "Connecting to IBKR gateway host=%s port=%s client_id=%s attempt=%s/%s",
+                    host,
+                    port,
+                    client_id,
+                    attempt,
+                    max_attempts,
+                )
                 self._gateway.connect(
-                    host=self._settings.tws_host,
-                    port=self._settings.tws_port,
-                    client_id=self._settings.ibkr_client_id,
+                    host=host,
+                    port=port,
+                    client_id=client_id,
                     timeout_ms=self._settings.ibkr_req_timeout_ms,
                 )
                 if self._gateway.is_connected():
                     self._connected = True
                     self._last_error = None
+                    CLIENT_LOG.info(
+                        "IBKR gateway connection established host=%s port=%s client_id=%s",
+                        host,
+                        port,
+                        client_id,
+                    )
                     return True
+                CLIENT_LOG.warning(
+                    "IBKR gateway reported disconnected state immediately after connect"
+                )
                 self.record_error(code=-1, message="Gateway reported disconnected state")
             except Exception as exc:  # pragma: no cover - exercised in tests
+                CLIENT_LOG.exception("IBKR gateway connection attempt failed: %s", exc)
                 self._record_exception(exc)
             finally:
                 elapsed_ms = max(0.0, (self._time() - start) * 1000.0)
                 self._metrics.update_ibkr_latency(elapsed_ms)
 
-            if attempt < retries:
+            if attempt < max_attempts:
                 self._sleep(retry_delay_sec)
 
+        CLIENT_LOG.error(
+            "Failed to connect to IBKR gateway after %s attempt(s) host=%s port=%s client_id=%s",
+            max_attempts,
+            host,
+            port,
+            client_id,
+        )
         self._connected = False
         return False
 
@@ -145,8 +225,10 @@ class IbkrClient:
         if not self.enabled or self._gateway is None:
             self._connected = False
             return
+        CLIENT_LOG.info("Disconnecting from IBKR gateway")
         self._gateway.disconnect()
         self._connected = False
+        CLIENT_LOG.info("IBKR gateway disconnected")
 
     def health(self) -> dict[str, Any]:
         """Return a health snapshot for diagnostics endpoints."""
@@ -216,6 +298,15 @@ class IbkrClient:
             "severity": info.severity,
             "hint": info.hint,
         }
+        log_level = _SEVERITY_TO_LEVEL.get(info.severity.upper(), logging.ERROR)
+        detail = message or info.hint or "unknown IBKR error"
+        CLIENT_LOG.log(
+            log_level,
+            "IBKR gateway error code=%s severity=%s detail=%s",
+            code,
+            info.severity,
+            detail,
+        )
         return info
 
     def map_error(self, code: int) -> IbkrErrorInfo:
@@ -227,3 +318,87 @@ class IbkrClient:
         code = getattr(exc, "code", -1)
         message = str(exc)
         return self.record_error(code=code, message=message)
+
+
+def _probe_gateway(host: str, port: int, timeout: float) -> tuple[bool, str | None]:
+    """Attempt a TCP connection to the IBKR gateway."""
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, None
+    except OSError as exc:
+        return False, str(exc)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        RUNNER_LOG.warning("Invalid %s=%s; falling back to %s", name, value, default)
+        return default
+
+
+def _run_monitor(settings: AppSettings, *, interval: float, timeout: float) -> int:
+    host = settings.tws_host
+    port = settings.tws_port
+    RUNNER_LOG.info(
+        "Monitoring IBKR gateway host=%s port=%s client_id=%s",
+        host,
+        port,
+        settings.ibkr_client_id,
+    )
+    reachable: bool | None = None
+
+    try:
+        while True:
+            ok, detail = _probe_gateway(host, port, timeout)
+            if ok and reachable is not True:
+                RUNNER_LOG.info("Gateway reachable at %s:%s", host, port)
+            elif not ok and reachable is not False:
+                RUNNER_LOG.warning(
+                    "Gateway unreachable at %s:%s (%s)",
+                    host,
+                    port,
+                    detail or "connection failed",
+                )
+            reachable = ok
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        RUNNER_LOG.info("IBKR adapter interrupted; shutting down.")
+        return 0
+    except Exception:  # pragma: no cover - defensive
+        RUNNER_LOG.exception("Unhandled error in IBKR adapter loop")
+        return 1
+
+
+def main() -> int:
+    """Run the standalone IBKR adapter monitor."""
+
+    load_dotenv()
+    _ensure_log_handler()
+
+    settings = AppSettings()
+    RUNNER_LOG.info(
+        "IBKR adapter starting (enabled=%s)",
+        settings.ibkr_enabled,
+    )
+
+    if not settings.ibkr_enabled:
+        RUNNER_LOG.warning("IBKR adapter disabled via IBKR_ENABLED=0; sleeping.")
+        try:
+            while True:
+                time.sleep(60)
+        except KeyboardInterrupt:
+            RUNNER_LOG.info("Shutdown requested while adapter disabled.")
+            return 0
+
+    interval = max(1.0, _env_float("IBKR_HEALTH_INTERVAL", 5.0))
+    timeout = max(0.5, _env_float("IBKR_CONNECT_TIMEOUT", 2.5))
+    return _run_monitor(settings, interval=interval, timeout=timeout)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
